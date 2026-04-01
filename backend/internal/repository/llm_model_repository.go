@@ -2,6 +2,7 @@ package repository
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"clawreef/internal/models"
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS llm_models (
   display_name VARCHAR(255) NOT NULL UNIQUE,
   description TEXT NULL,
   provider_type VARCHAR(100) NOT NULL,
+  protocol_type VARCHAR(100) NULL,
   base_url VARCHAR(500) NOT NULL,
   provider_model_name VARCHAR(255) NOT NULL,
   api_key TEXT NULL,
@@ -56,6 +58,34 @@ CREATE TABLE IF NOT EXISTS llm_models (
 
 	if _, err := r.sess.SQL().Exec(query); err != nil {
 		panic(fmt.Errorf("failed to ensure llm_models table: %w", err))
+	}
+
+	const alterProtocolTypeQuery = `
+ALTER TABLE llm_models
+  ADD COLUMN protocol_type VARCHAR(100) NULL AFTER provider_type;
+`
+
+	if _, err := r.sess.SQL().Exec(alterProtocolTypeQuery); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			panic(fmt.Errorf("failed to ensure llm_models protocol_type column: %w", err))
+		}
+	}
+
+	const backfillProtocolTypeQuery = `
+UPDATE llm_models
+SET protocol_type = CASE
+  WHEN LOWER(TRIM(provider_type)) = 'local' THEN 'openai-compatible'
+  WHEN LOWER(TRIM(provider_type)) = 'openai' THEN 'openai'
+  WHEN LOWER(TRIM(provider_type)) = 'anthropic' THEN 'anthropic'
+  WHEN LOWER(TRIM(provider_type)) = 'google' THEN 'google'
+  WHEN LOWER(TRIM(provider_type)) = 'azure-openai' THEN 'azure-openai'
+  ELSE 'openai-compatible'
+END
+WHERE protocol_type IS NULL OR TRIM(protocol_type) = '';
+`
+
+	if _, err := r.sess.SQL().Exec(backfillProtocolTypeQuery); err != nil {
+		panic(fmt.Errorf("failed to ensure llm_models protocol_type column: %w", err))
 	}
 }
 

@@ -13,6 +13,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -114,6 +117,10 @@ type AvailableModel struct {
 
 const autoModelID = "auto"
 const maxStoredIdentifierLength = 100
+const anthropicVersionHeader = "2023-06-01"
+const defaultAnthropicMaxTokens = 4096
+
+var providerVersionSegmentPattern = regexp.MustCompile(`(?i)^v\d+(?:[a-z0-9._-]*)?$`)
 
 type preparedChatRequest struct {
 	traceID       string
@@ -148,6 +155,117 @@ type openAIStreamChunk struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage,omitempty"`
+}
+
+type openAIStreamDelta struct {
+	Role      string      `json:"role,omitempty"`
+	Content   interface{} `json:"content,omitempty"`
+	ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
+}
+
+type openAIStreamChoice struct {
+	Index        int               `json:"index"`
+	Delta        openAIStreamDelta `json:"delta"`
+	FinishReason *string           `json:"finish_reason,omitempty"`
+}
+
+type openAIStreamResponseChunk struct {
+	ID      string               `json:"id"`
+	Object  string               `json:"object,omitempty"`
+	Created int64                `json:"created,omitempty"`
+	Model   string               `json:"model,omitempty"`
+	Choices []openAIStreamChoice `json:"choices"`
+	Usage   *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage,omitempty"`
+}
+
+type anthropicRequestMessage struct {
+	Role    string                  `json:"role"`
+	Content []anthropicContentBlock `json:"content"`
+}
+
+type anthropicRequestPayload struct {
+	Model       string                    `json:"model"`
+	Messages    []anthropicRequestMessage `json:"messages"`
+	System      string                    `json:"system,omitempty"`
+	MaxTokens   int                       `json:"max_tokens"`
+	Stream      bool                      `json:"stream,omitempty"`
+	Temperature *float64                  `json:"temperature,omitempty"`
+	TopP        *float64                  `json:"top_p,omitempty"`
+	StopSeqs    []string                  `json:"stop_sequences,omitempty"`
+	Tools       []anthropicToolDefinition `json:"tools,omitempty"`
+	ToolChoice  map[string]interface{}    `json:"tool_choice,omitempty"`
+}
+
+type anthropicToolDefinition struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description,omitempty"`
+	InputSchema interface{} `json:"input_schema"`
+}
+
+type anthropicContentBlock struct {
+	Type      string      `json:"type"`
+	Text      string      `json:"text,omitempty"`
+	ID        string      `json:"id,omitempty"`
+	Name      string      `json:"name,omitempty"`
+	Input     interface{} `json:"input,omitempty"`
+	ToolUseID string      `json:"tool_use_id,omitempty"`
+	Content   interface{} `json:"content,omitempty"`
+}
+
+type anthropicMessageResponse struct {
+	ID         string                  `json:"id"`
+	Type       string                  `json:"type,omitempty"`
+	Role       string                  `json:"role,omitempty"`
+	Model      string                  `json:"model,omitempty"`
+	Content    []anthropicContentBlock `json:"content"`
+	StopReason string                  `json:"stop_reason,omitempty"`
+	Usage      struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+type anthropicStreamEvent struct {
+	Type         string                    `json:"type"`
+	Message      *anthropicMessageResponse `json:"message,omitempty"`
+	Index        *int                      `json:"index,omitempty"`
+	ContentBlock *anthropicContentBlock    `json:"content_block,omitempty"`
+	Delta        *struct {
+		Type         string `json:"type,omitempty"`
+		Text         string `json:"text,omitempty"`
+		PartialJSON  string `json:"partial_json,omitempty"`
+		StopReason   string `json:"stop_reason,omitempty"`
+		StopSequence string `json:"stop_sequence,omitempty"`
+	} `json:"delta,omitempty"`
+	Usage *struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage,omitempty"`
+	Error *struct {
+		Type    string `json:"type,omitempty"`
+		Message string `json:"message,omitempty"`
+	} `json:"error,omitempty"`
+}
+
+type anthropicStreamState struct {
+	ResponseID       string
+	Model            string
+	Created          int64
+	PromptTokens     int
+	CompletionTokens int
+	AssistantText    strings.Builder
+	ToolCalls        map[int]*anthropicToolCallState
+	SentRole         bool
+}
+
+type anthropicToolCallState struct {
+	ID        string
+	Name      string
+	Arguments strings.Builder
 }
 
 // Service defines gateway operations.
@@ -227,9 +345,11 @@ func (s *service) ChatCompletions(ctx context.Context, userID int, req ChatCompl
 		return nil, traceID, err
 	}
 
-	switch prepared.resolvedModel.ProviderType {
-	case "openai", "openai-compatible", "local":
+	switch models.ResolveLLMProtocolTypeOrDefault(prepared.resolvedModel.ProviderType, prepared.resolvedModel.ProtocolType) {
+	case models.ProtocolTypeOpenAI, models.ProtocolTypeOpenAICompatible:
 		return s.callOpenAICompatible(ctx, prepared)
+	case models.ProtocolTypeAnthropic:
+		return s.callAnthropic(ctx, prepared)
 	default:
 		_ = s.auditEventService.RecordEvent(&models.AuditEvent{
 			TraceID:      prepared.traceID,
@@ -256,9 +376,11 @@ func (s *service) StreamChatCompletions(ctx context.Context, userID int, req Cha
 		return traceID, err
 	}
 
-	switch prepared.resolvedModel.ProviderType {
-	case "openai", "openai-compatible", "local":
+	switch models.ResolveLLMProtocolTypeOrDefault(prepared.resolvedModel.ProviderType, prepared.resolvedModel.ProtocolType) {
+	case models.ProtocolTypeOpenAI, models.ProtocolTypeOpenAICompatible:
 		return prepared.traceID, s.streamOpenAICompatible(ctx, prepared, w)
+	case models.ProtocolTypeAnthropic:
+		return prepared.traceID, s.streamAnthropic(ctx, prepared, w)
 	default:
 		_ = s.auditEventService.RecordEvent(&models.AuditEvent{
 			TraceID:      prepared.traceID,
@@ -453,6 +575,69 @@ func (s *service) callOpenAICompatible(ctx context.Context, prepared *preparedCh
 
 	assistantContent := extractAssistantContent(providerResponse)
 	s.recordSuccess(prepared, providerRequestBody, string(responseBody), assistantContent, providerResponse.Usage.PromptTokens, providerResponse.Usage.CompletionTokens, providerResponse.Usage.TotalTokens, int(time.Since(startedAt).Milliseconds()), false)
+	return proxyResponse, prepared.traceID, nil
+}
+
+func (s *service) callAnthropic(ctx context.Context, prepared *preparedChatRequest) (*ProxyResponse, string, error) {
+	resolvedAPIKey, err := s.secretRefService.ResolveString(ctx, prepared.resolvedModel.APIKey, prepared.resolvedModel.APIKeySecretRef)
+	if err != nil {
+		return nil, prepared.traceID, err
+	}
+
+	providerRequestBody, err := buildProviderRequestBody(prepared.req, prepared.resolvedModel)
+	if err != nil {
+		return nil, prepared.traceID, err
+	}
+
+	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, false)
+	if err != nil {
+		return nil, prepared.traceID, err
+	}
+
+	startedAt := time.Now()
+	response, err := s.httpClient.Do(httpRequest)
+	if err != nil {
+		s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("provider call failed: %v", err), providerRequestBody)
+		return nil, prepared.traceID, fmt.Errorf("failed to call provider: %w", err)
+	}
+	defer response.Body.Close()
+
+	responseBody, readErr := io.ReadAll(response.Body)
+	if readErr != nil {
+		s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("failed to read provider response: %v", readErr), providerRequestBody)
+		return nil, prepared.traceID, fmt.Errorf("failed to read provider response: %w", readErr)
+	}
+
+	proxyResponse := &ProxyResponse{
+		StatusCode: response.StatusCode,
+		Headers:    cloneProxyHeaders(response.Header),
+		Body:       responseBody,
+	}
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		message := strings.TrimSpace(string(responseBody))
+		if message == "" {
+			message = response.Status
+		}
+		s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, "provider returned non-success status: "+message, providerRequestBody)
+		return proxyResponse, prepared.traceID, nil
+	}
+
+	var providerResponse anthropicMessageResponse
+	if err := json.Unmarshal(responseBody, &providerResponse); err != nil {
+		s.recordSuccess(prepared, providerRequestBody, string(responseBody), "", 0, 0, 0, int(time.Since(startedAt).Milliseconds()), false)
+		return proxyResponse, prepared.traceID, nil
+	}
+
+	normalizedBody, assistantContent, promptTokens, completionTokens, totalTokens, normalizeErr := normalizeAnthropicResponse(providerResponse)
+	if normalizeErr != nil {
+		s.recordSuccess(prepared, providerRequestBody, string(responseBody), "", providerResponse.Usage.InputTokens, providerResponse.Usage.OutputTokens, providerResponse.Usage.InputTokens+providerResponse.Usage.OutputTokens, int(time.Since(startedAt).Milliseconds()), false)
+		return proxyResponse, prepared.traceID, nil
+	}
+
+	proxyResponse.Headers.Del("Content-Length")
+	proxyResponse.Body = normalizedBody
+	s.recordSuccess(prepared, providerRequestBody, string(normalizedBody), assistantContent, promptTokens, completionTokens, totalTokens, int(time.Since(startedAt).Milliseconds()), false)
 	return proxyResponse, prepared.traceID, nil
 }
 
@@ -702,6 +887,163 @@ func (s *service) streamOpenAICompatible(ctx context.Context, prepared *prepared
 	return nil
 }
 
+func (s *service) streamAnthropic(ctx context.Context, prepared *preparedChatRequest, w http.ResponseWriter) error {
+	resolvedAPIKey, err := s.secretRefService.ResolveString(ctx, prepared.resolvedModel.APIKey, prepared.resolvedModel.APIKeySecretRef)
+	if err != nil {
+		return err
+	}
+
+	providerRequestBody, err := buildProviderRequestBody(prepared.req, prepared.resolvedModel)
+	if err != nil {
+		return err
+	}
+
+	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, true)
+	if err != nil {
+		return err
+	}
+
+	startedAt := time.Now()
+	response, err := s.httpClient.Do(httpRequest)
+	if err != nil {
+		s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("provider call failed: %v", err), providerRequestBody)
+		return fmt.Errorf("failed to call provider: %w", err)
+	}
+	defer response.Body.Close()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return errors.New("streaming response writer is not supported")
+	}
+
+	copyProxyHeaders(w.Header(), response.Header)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Trace-ID", prepared.traceID)
+	w.WriteHeader(response.StatusCode)
+	flusher.Flush()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(response.Body)
+		if len(responseBody) > 0 {
+			_, _ = w.Write(responseBody)
+			flusher.Flush()
+		}
+		message := strings.TrimSpace(string(responseBody))
+		if message == "" {
+			message = response.Status
+		}
+		s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, "provider returned non-success status: "+message, providerRequestBody)
+		return nil
+	}
+
+	reader := bufio.NewReader(response.Body)
+	var rawStream strings.Builder
+	state := &anthropicStreamState{
+		Created:   time.Now().Unix(),
+		ToolCalls: map[int]*anthropicToolCallState{},
+	}
+	eventType := ""
+	dataLines := make([]string, 0, 2)
+	streamFailed := false
+	done := false
+
+	flushEvent := func() error {
+		if len(dataLines) == 0 {
+			eventType = ""
+			return nil
+		}
+		payload := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		finished, err := processAnthropicStreamEvent(payload, eventType, state, w, flusher)
+		eventType = ""
+		if err != nil {
+			return err
+		}
+		if finished {
+			done = true
+		}
+		return nil
+	}
+
+	for !done {
+		line, readErr := reader.ReadString('\n')
+		if line != "" {
+			rawStream.WriteString(line)
+			trimmedLine := strings.TrimRight(line, "\r\n")
+			switch {
+			case trimmedLine == "":
+				if err := flushEvent(); err != nil {
+					streamFailed = true
+					s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("failed while processing provider stream: %v", err), providerRequestBody)
+					break
+				}
+			case strings.HasPrefix(trimmedLine, "event:"):
+				eventType = strings.TrimSpace(strings.TrimPrefix(trimmedLine, "event:"))
+			case strings.HasPrefix(trimmedLine, "data:"):
+				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(trimmedLine, "data:")))
+			}
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				if err := flushEvent(); err != nil {
+					streamFailed = true
+					s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("failed while processing provider stream: %v", err), providerRequestBody)
+				}
+				break
+			}
+			streamFailed = true
+			s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("failed while reading provider stream: %v", readErr), providerRequestBody)
+			break
+		}
+	}
+
+	if !streamFailed {
+		finalChunk := openAIStreamResponseChunk{
+			ID:      defaultIfBlank(state.ResponseID, "chatcmpl-anthropic"),
+			Object:  "chat.completion.chunk",
+			Created: state.Created,
+			Model:   state.Model,
+			Choices: []openAIStreamChoice{
+				{
+					Index: 0,
+					Delta: openAIStreamDelta{},
+				},
+			},
+			Usage: &struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			}{
+				PromptTokens:     state.PromptTokens,
+				CompletionTokens: state.CompletionTokens,
+				TotalTokens:      state.PromptTokens + state.CompletionTokens,
+			},
+		}
+		if err := emitOpenAIStreamPayload(w, flusher, finalChunk); err != nil {
+			s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("failed while writing normalized stream: %v", err), providerRequestBody)
+			return nil
+		}
+		if err := emitOpenAIStreamDone(w, flusher); err != nil {
+			s.recordFailure(prepared.traceID, prepared.requestID, prepared.req, userIDOrZero(prepared.userIDPtr), prepared.resolvedModel, startedAt, fmt.Sprintf("failed while closing normalized stream: %v", err), providerRequestBody)
+			return nil
+		}
+
+		assistantContent := strings.TrimSpace(state.AssistantText.String())
+		if assistantContent == "" {
+			assistantContent = renderAnthropicToolCalls(state)
+		}
+		if assistantContent == "" {
+			assistantContent = rawStream.String()
+		}
+		normalizedStream := rawStream.String()
+		s.recordSuccess(prepared, providerRequestBody, normalizedStream, assistantContent, state.PromptTokens, state.CompletionTokens, state.PromptTokens+state.CompletionTokens, int(time.Since(startedAt).Milliseconds()), true)
+	}
+	return nil
+}
+
 func inspectStreamLine(line string, assistantText *strings.Builder, promptTokens, completionTokens, totalTokens *int) bool {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "data:") {
@@ -740,6 +1082,225 @@ func buildProviderRequestBody(req ChatCompletionRequest, model *models.LLMModel)
 	if model == nil {
 		return nil, errors.New("model is not active or does not exist")
 	}
+
+	switch models.ResolveLLMProtocolTypeOrDefault(model.ProviderType, model.ProtocolType) {
+	case models.ProtocolTypeAnthropic:
+		return buildAnthropicRequestBody(req, model)
+	default:
+		return buildOpenAICompatibleRequestBody(req, model)
+	}
+}
+
+func processAnthropicStreamEvent(payload, eventType string, state *anthropicStreamState, w io.Writer, flusher http.Flusher) (bool, error) {
+	if strings.TrimSpace(payload) == "" {
+		return false, nil
+	}
+
+	var event anthropicStreamEvent
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return false, nil
+	}
+	if strings.TrimSpace(eventType) == "" {
+		eventType = event.Type
+	}
+
+	switch eventType {
+	case "message_start":
+		if event.Message != nil {
+			state.ResponseID = event.Message.ID
+			state.Model = event.Message.Model
+			state.PromptTokens = event.Message.Usage.InputTokens
+		}
+	case "content_block_start":
+		if event.ContentBlock == nil || event.Index == nil {
+			return false, nil
+		}
+		index := *event.Index
+		switch event.ContentBlock.Type {
+		case "text":
+			chunk := openAIStreamResponseChunk{
+				ID:      defaultIfBlank(state.ResponseID, "chatcmpl-anthropic"),
+				Object:  "chat.completion.chunk",
+				Created: state.Created,
+				Model:   state.Model,
+				Choices: []openAIStreamChoice{
+					{
+						Index: 0,
+						Delta: openAIStreamDelta{
+							Role: conditionalAssistantRole(state),
+						},
+					},
+				},
+			}
+			if err := emitOpenAIStreamPayload(w, flusher, chunk); err != nil {
+				return false, err
+			}
+		case "tool_use":
+			toolState := &anthropicToolCallState{
+				ID:   defaultIfBlank(event.ContentBlock.ID, fmt.Sprintf("call_%d", index)),
+				Name: strings.TrimSpace(event.ContentBlock.Name),
+			}
+			state.ToolCalls[index] = toolState
+			toolCallIndex := index
+			chunk := openAIStreamResponseChunk{
+				ID:      defaultIfBlank(state.ResponseID, "chatcmpl-anthropic"),
+				Object:  "chat.completion.chunk",
+				Created: state.Created,
+				Model:   state.Model,
+				Choices: []openAIStreamChoice{
+					{
+						Index: 0,
+						Delta: openAIStreamDelta{
+							Role: conditionalAssistantRole(state),
+							ToolCalls: []ToolCall{
+								{
+									ID:    toolState.ID,
+									Type:  "function",
+									Index: &toolCallIndex,
+									Function: &ToolCallFunction{
+										Name:      toolState.Name,
+										Arguments: "",
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			if err := emitOpenAIStreamPayload(w, flusher, chunk); err != nil {
+				return false, err
+			}
+		}
+	case "content_block_delta":
+		if event.Index == nil || event.Delta == nil {
+			return false, nil
+		}
+		index := *event.Index
+		switch event.Delta.Type {
+		case "text_delta":
+			if event.Delta.Text == "" {
+				return false, nil
+			}
+			state.AssistantText.WriteString(event.Delta.Text)
+			chunk := openAIStreamResponseChunk{
+				ID:      defaultIfBlank(state.ResponseID, "chatcmpl-anthropic"),
+				Object:  "chat.completion.chunk",
+				Created: state.Created,
+				Model:   state.Model,
+				Choices: []openAIStreamChoice{
+					{
+						Index: 0,
+						Delta: openAIStreamDelta{
+							Content: event.Delta.Text,
+						},
+					},
+				},
+			}
+			if err := emitOpenAIStreamPayload(w, flusher, chunk); err != nil {
+				return false, err
+			}
+		case "input_json_delta":
+			toolState := state.ToolCalls[index]
+			if toolState == nil {
+				return false, nil
+			}
+			toolState.Arguments.WriteString(event.Delta.PartialJSON)
+			toolCallIndex := index
+			chunk := openAIStreamResponseChunk{
+				ID:      defaultIfBlank(state.ResponseID, "chatcmpl-anthropic"),
+				Object:  "chat.completion.chunk",
+				Created: state.Created,
+				Model:   state.Model,
+				Choices: []openAIStreamChoice{
+					{
+						Index: 0,
+						Delta: openAIStreamDelta{
+							ToolCalls: []ToolCall{
+								{
+									ID:    toolState.ID,
+									Type:  "function",
+									Index: &toolCallIndex,
+									Function: &ToolCallFunction{
+										Arguments: event.Delta.PartialJSON,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			if err := emitOpenAIStreamPayload(w, flusher, chunk); err != nil {
+				return false, err
+			}
+		}
+	case "message_delta":
+		if event.Usage != nil {
+			state.CompletionTokens = event.Usage.OutputTokens
+		}
+		if event.Delta != nil {
+			finishReason := normalizeAnthropicStopReason(event.Delta.StopReason)
+			if finishReason != "" {
+				chunk := openAIStreamResponseChunk{
+					ID:      defaultIfBlank(state.ResponseID, "chatcmpl-anthropic"),
+					Object:  "chat.completion.chunk",
+					Created: state.Created,
+					Model:   state.Model,
+					Choices: []openAIStreamChoice{
+						{
+							Index:        0,
+							Delta:        openAIStreamDelta{},
+							FinishReason: &finishReason,
+						},
+					},
+				}
+				if err := emitOpenAIStreamPayload(w, flusher, chunk); err != nil {
+					return false, err
+				}
+			}
+		}
+	case "message_stop":
+		return true, nil
+	case "error":
+		if event.Error != nil && strings.TrimSpace(event.Error.Message) != "" {
+			return false, errors.New(event.Error.Message)
+		}
+	}
+
+	return false, nil
+}
+
+func emitOpenAIStreamPayload(w io.Writer, flusher http.Flusher, payload interface{}) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func emitOpenAIStreamDone(w io.Writer, flusher http.Flusher) error {
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func conditionalAssistantRole(state *anthropicStreamState) string {
+	if state.SentRole {
+		return ""
+	}
+	state.SentRole = true
+	return "assistant"
+}
+
+func buildOpenAICompatibleRequestBody(req ChatCompletionRequest, model *models.LLMModel) ([]byte, error) {
+	if model == nil {
+		return nil, errors.New("model is not active or does not exist")
+	}
 	payload := map[string]json.RawMessage{}
 	if len(req.RawBody) > 0 {
 		if err := json.Unmarshal(req.RawBody, &payload); err != nil {
@@ -765,8 +1326,65 @@ func buildProviderRequestBody(req ChatCompletionRequest, model *models.LLMModel)
 	return body, nil
 }
 
-func buildProviderHTTPRequest(ctx context.Context, traceID, requestID string, model *models.LLMModel, providerRequestBody []byte, resolvedAPIKey *string, acceptStream bool) (*http.Request, error) {
+func buildAnthropicRequestBody(req ChatCompletionRequest, model *models.LLMModel) ([]byte, error) {
+	systemPrompt, messages := convertChatMessagesToAnthropic(req.Messages)
+	tools, err := convertToolsToAnthropic(req.Tools)
+	if err != nil {
+		return nil, err
+	}
+	toolChoice, err := convertToolChoiceToAnthropic(req.ToolChoice)
+	if err != nil {
+		return nil, err
+	}
 
+	stopSequences, err := convertStopSequences(req.Stop)
+	if err != nil {
+		return nil, err
+	}
+
+	maxTokens := defaultAnthropicMaxTokens
+	if req.MaxTokens != nil && *req.MaxTokens > 0 {
+		maxTokens = *req.MaxTokens
+	}
+
+	payload := anthropicRequestPayload{
+		Model:       model.ProviderModelName,
+		Messages:    messages,
+		System:      systemPrompt,
+		MaxTokens:   maxTokens,
+		Stream:      req.Stream,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		StopSeqs:    stopSequences,
+	}
+	if len(tools) > 0 {
+		payload.Tools = tools
+		if toolChoice != nil {
+			payload.ToolChoice = toolChoice
+		}
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode anthropic request: %w", err)
+	}
+	return body, nil
+}
+
+func buildProviderHTTPRequest(ctx context.Context, traceID, requestID string, model *models.LLMModel, providerRequestBody []byte, resolvedAPIKey *string, acceptStream bool) (*http.Request, error) {
+	if model == nil {
+		return nil, errors.New("model is not active or does not exist")
+	}
+
+	switch models.ResolveLLMProtocolTypeOrDefault(model.ProviderType, model.ProtocolType) {
+	case models.ProtocolTypeAnthropic:
+		return buildAnthropicProviderHTTPRequest(ctx, traceID, requestID, model, providerRequestBody, resolvedAPIKey, acceptStream)
+	default:
+		return buildOpenAICompatibleProviderHTTPRequest(ctx, traceID, requestID, model, providerRequestBody, resolvedAPIKey, acceptStream)
+	}
+}
+
+func buildOpenAICompatibleProviderHTTPRequest(ctx context.Context, traceID, requestID string, model *models.LLMModel, providerRequestBody []byte, resolvedAPIKey *string, acceptStream bool) (*http.Request, error) {
 	endpoint := strings.TrimRight(strings.TrimSpace(model.BaseURL), "/") + "/chat/completions"
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(providerRequestBody))
 	if err != nil {
@@ -784,6 +1402,440 @@ func buildProviderHTTPRequest(ctx context.Context, traceID, requestID string, mo
 		httpRequest.Header.Set("Authorization", "Bearer "+strings.TrimSpace(*resolvedAPIKey))
 	}
 	return httpRequest, nil
+}
+
+func buildAnthropicProviderHTTPRequest(ctx context.Context, traceID, requestID string, model *models.LLMModel, providerRequestBody []byte, resolvedAPIKey *string, acceptStream bool) (*http.Request, error) {
+	endpoint, err := buildProviderAPIEndpoint(model.BaseURL, "v1", "messages")
+	if err != nil {
+		return nil, err
+	}
+
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(providerRequestBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build provider request: %w", err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("anthropic-version", anthropicVersionHeader)
+	if acceptStream {
+		httpRequest.Header.Set("Accept", "text/event-stream")
+	} else {
+		httpRequest.Header.Set("Accept", "application/json")
+	}
+	httpRequest.Header.Set("X-Trace-ID", traceID)
+	httpRequest.Header.Set("X-Request-ID", requestID)
+	if resolvedAPIKey != nil && strings.TrimSpace(*resolvedAPIKey) != "" {
+		httpRequest.Header.Set("x-api-key", strings.TrimSpace(*resolvedAPIKey))
+	}
+	return httpRequest, nil
+}
+
+func buildProviderAPIEndpoint(baseURL, versionPrefix, resource string) (string, error) {
+	trimmed := strings.TrimSpace(strings.TrimRight(baseURL, "/"))
+	if trimmed == "" {
+		return "", errors.New("base URL is required")
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", errors.New("base URL is invalid")
+	}
+
+	versionPath := "/" + strings.Trim(versionPrefix, "/")
+	resourcePath := strings.Trim(resource, "/")
+	if strings.HasSuffix(strings.ToLower(parsed.Path), strings.ToLower(versionPath)) {
+		return trimmed + "/" + resourcePath, nil
+	}
+
+	pathSegments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	lastSegment := ""
+	if len(pathSegments) > 0 {
+		lastSegment = pathSegments[len(pathSegments)-1]
+	}
+	if providerVersionSegmentPattern.MatchString(lastSegment) {
+		return trimmed + "/" + resourcePath, nil
+	}
+
+	return trimmed + versionPath + "/" + resourcePath, nil
+}
+
+func convertChatMessagesToAnthropic(messages []ChatMessage) (string, []anthropicRequestMessage) {
+	systemParts := make([]string, 0)
+	converted := make([]anthropicRequestMessage, 0, len(messages))
+
+	appendMessage := func(role string, blocks []anthropicContentBlock) {
+		if len(blocks) == 0 {
+			return
+		}
+		if len(converted) > 0 && converted[len(converted)-1].Role == role {
+			converted[len(converted)-1].Content = append(converted[len(converted)-1].Content, blocks...)
+			return
+		}
+		converted = append(converted, anthropicRequestMessage{
+			Role:    role,
+			Content: blocks,
+		})
+	}
+
+	for _, message := range messages {
+		role := strings.TrimSpace(strings.ToLower(message.Role))
+		switch role {
+		case "system":
+			if text := strings.TrimSpace(flattenChatMessage(message)); text != "" {
+				systemParts = append(systemParts, text)
+			}
+		case "assistant":
+			appendMessage("assistant", convertAssistantMessageToAnthropicBlocks(message))
+		case "tool":
+			appendMessage("user", convertToolMessageToAnthropicBlocks(message))
+		default:
+			appendMessage("user", convertUserMessageToAnthropicBlocks(message))
+		}
+	}
+
+	return strings.Join(systemParts, "\n\n"), converted
+}
+
+func convertUserMessageToAnthropicBlocks(message ChatMessage) []anthropicContentBlock {
+	blocks := convertContentToAnthropicTextBlocks(message.Content)
+	if len(blocks) > 0 {
+		return blocks
+	}
+	fallback := strings.TrimSpace(flattenChatMessage(message))
+	if fallback == "" {
+		return nil
+	}
+	return []anthropicContentBlock{{Type: "text", Text: fallback}}
+}
+
+func convertAssistantMessageToAnthropicBlocks(message ChatMessage) []anthropicContentBlock {
+	blocks := convertContentToAnthropicTextBlocks(message.Content)
+	for _, toolCall := range message.ToolCalls {
+		if toolCall.Function == nil {
+			continue
+		}
+		blocks = append(blocks, anthropicContentBlock{
+			Type:  "tool_use",
+			ID:    defaultIfBlank(toolCall.ID, "tool_call"),
+			Name:  strings.TrimSpace(toolCall.Function.Name),
+			Input: parseToolCallArguments(toolCall.Function.Arguments),
+		})
+	}
+	return blocks
+}
+
+func convertToolMessageToAnthropicBlocks(message ChatMessage) []anthropicContentBlock {
+	toolUseID := strings.TrimSpace(message.ToolCallID)
+	content := strings.TrimSpace(flattenMessageContent(message.Content))
+	if content == "" {
+		content = mustJSONString(message.Content)
+	}
+	if toolUseID == "" && content == "" {
+		return nil
+	}
+	return []anthropicContentBlock{
+		{
+			Type:      "tool_result",
+			ToolUseID: toolUseID,
+			Content:   defaultIfBlank(content, "{}"),
+		},
+	}
+}
+
+func convertContentToAnthropicTextBlocks(content interface{}) []anthropicContentBlock {
+	switch value := content.(type) {
+	case nil:
+		return nil
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return nil
+		}
+		return []anthropicContentBlock{{Type: "text", Text: value}}
+	case []interface{}:
+		blocks := make([]anthropicContentBlock, 0, len(value))
+		for _, item := range value {
+			text := strings.TrimSpace(flattenStructuredContentPart(item))
+			if text == "" {
+				continue
+			}
+			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: text})
+		}
+		if len(blocks) > 0 {
+			return blocks
+		}
+	case map[string]interface{}:
+		if text := strings.TrimSpace(flattenStructuredContentPart(value)); text != "" {
+			return []anthropicContentBlock{{Type: "text", Text: text}}
+		}
+	}
+
+	flattened := strings.TrimSpace(flattenMessageContent(content))
+	if flattened == "" {
+		return nil
+	}
+	return []anthropicContentBlock{{Type: "text", Text: flattened}}
+}
+
+func convertToolsToAnthropic(raw json.RawMessage) ([]anthropicToolDefinition, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+
+	var items []map[string]interface{}
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("failed to decode provider tools: %w", err)
+	}
+
+	tools := make([]anthropicToolDefinition, 0, len(items))
+	for _, item := range items {
+		itemType, _ := item["type"].(string)
+		if strings.TrimSpace(itemType) != "" && !strings.EqualFold(strings.TrimSpace(itemType), "function") {
+			continue
+		}
+		functionValue, ok := item["function"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := functionValue["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		description, _ := functionValue["description"].(string)
+		inputSchema := functionValue["parameters"]
+		if inputSchema == nil {
+			inputSchema = map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			}
+		}
+		tools = append(tools, anthropicToolDefinition{
+			Name:        strings.TrimSpace(name),
+			Description: strings.TrimSpace(description),
+			InputSchema: inputSchema,
+		})
+	}
+
+	return tools, nil
+}
+
+func convertToolChoiceToAnthropic(raw json.RawMessage) (map[string]interface{}, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to decode tool choice: %w", err)
+	}
+
+	switch value := parsed.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "", "none":
+			return nil, nil
+		case "required":
+			return map[string]interface{}{"type": "any"}, nil
+		case "auto", "any":
+			return map[string]interface{}{"type": strings.ToLower(strings.TrimSpace(value))}, nil
+		}
+	case map[string]interface{}:
+		choiceType, _ := value["type"].(string)
+		switch strings.ToLower(strings.TrimSpace(choiceType)) {
+		case "none", "":
+			return nil, nil
+		case "function":
+			functionValue, _ := value["function"].(map[string]interface{})
+			name, _ := functionValue["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				return nil, nil
+			}
+			return map[string]interface{}{"type": "tool", "name": strings.TrimSpace(name)}, nil
+		case "tool":
+			return value, nil
+		case "auto", "any":
+			return map[string]interface{}{"type": strings.ToLower(strings.TrimSpace(choiceType))}, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func convertStopSequences(raw json.RawMessage) ([]string, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		single = strings.TrimSpace(single)
+		if single == "" {
+			return nil, nil
+		}
+		return []string{single}, nil
+	}
+
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil, fmt.Errorf("failed to decode stop sequences: %w", err)
+	}
+
+	filtered := make([]string, 0, len(many))
+	for _, item := range many {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			filtered = append(filtered, trimmed)
+		}
+	}
+	return filtered, nil
+}
+
+func parseToolCallArguments(raw string) interface{} {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return map[string]interface{}{}
+	}
+
+	var parsed interface{}
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		return map[string]interface{}{
+			"raw": trimmed,
+		}
+	}
+	return parsed
+}
+
+func normalizeAnthropicResponse(response anthropicMessageResponse) ([]byte, string, int, int, int, error) {
+	normalized := ChatCompletionResponse{
+		ID:      defaultIfBlank(response.ID, "chatcmpl-anthropic"),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   response.Model,
+		Usage: struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		}{
+			PromptTokens:     response.Usage.InputTokens,
+			CompletionTokens: response.Usage.OutputTokens,
+			TotalTokens:      response.Usage.InputTokens + response.Usage.OutputTokens,
+		},
+	}
+
+	contentValue, toolCalls := convertAnthropicBlocksToOpenAIMessage(response.Content)
+	normalized.Choices = []struct {
+		Index   int `json:"index"`
+		Message struct {
+			Role      string      `json:"role"`
+			Content   interface{} `json:"content"`
+			ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
+			Refusal   interface{} `json:"refusal,omitempty"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason,omitempty"`
+	}{
+		{
+			Index: 0,
+			Message: struct {
+				Role      string      `json:"role"`
+				Content   interface{} `json:"content"`
+				ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
+				Refusal   interface{} `json:"refusal,omitempty"`
+			}{
+				Role:      defaultIfBlank(response.Role, "assistant"),
+				Content:   contentValue,
+				ToolCalls: toolCalls,
+			},
+			FinishReason: normalizeAnthropicStopReason(response.StopReason),
+		},
+	}
+
+	body, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, "", 0, 0, 0, err
+	}
+
+	return body, extractAssistantContent(normalized), normalized.Usage.PromptTokens, normalized.Usage.CompletionTokens, normalized.Usage.TotalTokens, nil
+}
+
+func convertAnthropicBlocksToOpenAIMessage(blocks []anthropicContentBlock) (interface{}, []ToolCall) {
+	textParts := make([]string, 0)
+	toolCalls := make([]ToolCall, 0)
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			if strings.TrimSpace(block.Text) != "" {
+				textParts = append(textParts, block.Text)
+			}
+		case "tool_use":
+			inputPayload := "{}"
+			if block.Input != nil {
+				if encoded, err := json.Marshal(block.Input); err == nil {
+					inputPayload = string(encoded)
+				}
+			}
+			toolCalls = append(toolCalls, ToolCall{
+				ID:   defaultIfBlank(block.ID, "tool_call"),
+				Type: "function",
+				Function: &ToolCallFunction{
+					Name:      strings.TrimSpace(block.Name),
+					Arguments: inputPayload,
+				},
+			})
+		}
+	}
+
+	if len(textParts) > 0 {
+		return strings.Join(textParts, "\n"), toolCalls
+	}
+	if len(toolCalls) > 0 {
+		return nil, toolCalls
+	}
+	return "", nil
+}
+
+func normalizeAnthropicStopReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "end_turn", "stop_sequence":
+		return "stop"
+	case "max_tokens":
+		return "length"
+	case "tool_use":
+		return "tool_calls"
+	default:
+		return ""
+	}
+}
+
+func renderAnthropicToolCalls(state *anthropicStreamState) string {
+	if len(state.ToolCalls) == 0 {
+		return ""
+	}
+
+	indexes := make([]int, 0, len(state.ToolCalls))
+	for index := range state.ToolCalls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+
+	parts := make([]string, 0, len(state.ToolCalls))
+	for _, index := range indexes {
+		toolState := state.ToolCalls[index]
+		if toolState == nil {
+			continue
+		}
+		args := strings.TrimSpace(toolState.Arguments.String())
+		switch {
+		case toolState.Name != "" && args != "":
+			parts = append(parts, fmt.Sprintf("tool_call %s(%s)", toolState.Name, args))
+		case toolState.Name != "":
+			parts = append(parts, "tool_call "+toolState.Name)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func defaultIfBlank(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func (s *service) recordBlockedInvocation(traceID, requestID string, req ChatCompletionRequest, userID int, model *models.LLMModel, reason string) *int {

@@ -5,6 +5,7 @@ export interface LLMModel {
   display_name: string;
   description?: string;
   provider_type: string;
+  protocol_type?: string;
   base_url: string;
   provider_model_name: string;
   api_key?: string;
@@ -36,6 +37,7 @@ export const modelService = {
 
   discoverModels: async (request: {
     provider_type: string;
+    protocol_type?: string;
     base_url: string;
     api_key?: string;
     api_key_secret_ref?: string;

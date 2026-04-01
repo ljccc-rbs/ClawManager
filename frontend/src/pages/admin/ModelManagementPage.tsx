@@ -10,6 +10,7 @@ import {
   BUILTIN_PROVIDER_TEMPLATES,
   findProviderTemplate,
   normalizeBaseUrl,
+  resolveProviderProtocolType,
   type ProviderTemplate,
 } from '../../lib/modelProviderTemplates';
 
@@ -20,6 +21,14 @@ const PROVIDER_TYPE_LABELS: Record<string, string> = {
   google: 'Google',
   'azure-openai': 'Azure OpenAI',
   local: 'Local / Internal',
+};
+
+const PROTOCOL_TYPE_LABELS: Record<string, string> = {
+  'openai-compatible': 'OpenAI Compatible',
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+  google: 'Google',
+  'azure-openai': 'Azure OpenAI',
 };
 
 interface EditableModel extends LLMModel {
@@ -40,6 +49,7 @@ type EditableModelSnapshot = Pick<
   | 'display_name'
   | 'description'
   | 'provider_type'
+  | 'protocol_type'
   | 'base_url'
   | 'provider_model_name'
   | 'api_key'
@@ -58,6 +68,7 @@ const captureSnapshot = (card: EditableModel): EditableModelSnapshot => ({
   display_name: card.display_name,
   description: card.description,
   provider_type: card.provider_type,
+  protocol_type: card.protocol_type,
   base_url: card.base_url,
   provider_model_name: card.provider_model_name,
   api_key: card.api_key,
@@ -77,6 +88,7 @@ const createEmptyModel = (): EditableModel => ({
   display_name: '',
   description: '',
   provider_type: '',
+  protocol_type: '',
   base_url: '',
   provider_model_name: '',
   api_key: '',
@@ -104,6 +116,7 @@ const AUTO_DISCOVERY_PROVIDERS = new Set([
 function buildDiscoveryKey(card: EditableModel) {
   return [
     card.provider_type,
+    resolveProviderProtocolType(card.provider_type, card.protocol_type),
     card.base_url.trim(),
     card.api_key?.trim() ?? '',
     card.api_key_secret_ref?.trim() ?? '',
@@ -135,7 +148,11 @@ function getProviderTypeLabel(providerType: string) {
   return PROVIDER_TYPE_LABELS[providerType] ?? providerType;
 }
 
-function buildCurrentTemplate(card: Pick<EditableModel, 'provider_type' | 'base_url'>, label: string): ProviderTemplate | undefined {
+function getProtocolTypeLabel(protocolType: string) {
+  return PROTOCOL_TYPE_LABELS[protocolType] ?? protocolType;
+}
+
+function buildCurrentTemplate(card: Pick<EditableModel, 'provider_type' | 'protocol_type' | 'base_url'>, label: string): ProviderTemplate | undefined {
   const providerType = card.provider_type.trim().toLowerCase();
   const baseUrl = card.base_url.trim();
   if (!providerType || !baseUrl) {
@@ -146,6 +163,7 @@ function buildCurrentTemplate(card: Pick<EditableModel, 'provider_type' | 'base_
     id: `current-${providerType}-${normalizeBaseUrl(baseUrl)}`,
     label,
     providerType,
+    protocolType: resolveProviderProtocolType(providerType, card.protocol_type),
     baseUrl,
     allowCustomBaseUrl: providerType === 'local',
     keywords: ['current', 'custom', 'existing', providerType, baseUrl],
@@ -174,6 +192,11 @@ const TEMPLATE_ICON_META: Record<string, { src: string; glyph: string; className
     src: '/vendor-icons/openai.png',
     glyph: 'OA',
     className: 'border-[#cfe7dc] bg-[#eff8f3] text-[#0f7a5c]',
+  },
+  anthropic: {
+    src: '/vendor-icons/anthropic.svg',
+    glyph: 'AN',
+    className: 'border-[#efd8c8] bg-[#fff5ed] text-[#8a4b2b]',
   },
   openrouter: {
     src: '/vendor-icons/openrouter.ico',
@@ -482,6 +505,7 @@ const ModelManagementPage: React.FC = () => {
         setModels(items.map((item, index) => ({
           ...item,
           description: item.description ?? '',
+          protocol_type: resolveProviderProtocolType(item.provider_type, item.protocol_type),
           api_key: item.api_key ?? '',
           api_key_secret_ref: item.api_key_secret_ref ?? '',
           local_id: `${item.id ?? item.display_name}-${index}`,
@@ -555,6 +579,7 @@ const ModelManagementPage: React.FC = () => {
       const next = { ...card, ...patch, error: patch.error ?? card.error };
       if (
         Object.prototype.hasOwnProperty.call(patch, 'provider_type') ||
+        Object.prototype.hasOwnProperty.call(patch, 'protocol_type') ||
         Object.prototype.hasOwnProperty.call(patch, 'base_url') ||
         Object.prototype.hasOwnProperty.call(patch, 'api_key') ||
         Object.prototype.hasOwnProperty.call(patch, 'api_key_secret_ref')
@@ -565,6 +590,7 @@ const ModelManagementPage: React.FC = () => {
         next.discovering = false;
         if (
           Object.prototype.hasOwnProperty.call(patch, 'provider_type') ||
+          Object.prototype.hasOwnProperty.call(patch, 'protocol_type') ||
           Object.prototype.hasOwnProperty.call(patch, 'base_url')
         ) {
           next.provider_model_name = '';
@@ -618,6 +644,7 @@ const ModelManagementPage: React.FC = () => {
     try {
       const discovered = await modelService.discoverModels({
         provider_type: snapshot.provider_type,
+        protocol_type: resolveProviderProtocolType(snapshot.provider_type, snapshot.protocol_type),
         base_url: snapshot.base_url.trim(),
         api_key: snapshot.api_key?.trim() || undefined,
         api_key_secret_ref: snapshot.api_key_secret_ref?.trim() || undefined,
@@ -676,6 +703,7 @@ const ModelManagementPage: React.FC = () => {
         display_name: card.display_name.trim(),
         description: card.description?.trim() || undefined,
         provider_type: card.provider_type,
+        protocol_type: resolveProviderProtocolType(card.provider_type, card.protocol_type),
         base_url: card.base_url.trim(),
         provider_model_name: card.provider_model_name.trim(),
         api_key: card.api_key?.trim() || undefined,
@@ -771,9 +799,12 @@ const ModelManagementPage: React.FC = () => {
                 const discoveredModels = card.discovered_models ?? [];
                 const currentTemplate = getSelectedTemplate(card, t('modelManagementPage.currentVendorTemplate'));
                 const templateOptions = getTemplateOptions(card, t('modelManagementPage.currentVendorTemplate'));
+                const effectiveProtocolType = resolveProviderProtocolType(card.provider_type, card.protocol_type);
                 const providerHeadline = currentTemplate?.label || getProviderTypeLabel(card.provider_type);
                 const providerTypeLabel = getProviderTypeLabel(card.provider_type || currentTemplate?.providerType || '');
+                const protocolTypeLabel = getProtocolTypeLabel(effectiveProtocolType);
                 const allowBaseUrlEditing = Boolean(currentTemplate?.allowCustomBaseUrl);
+                const showsProtocolSelector = card.provider_type === 'local';
                 const providerModelListId = `provider-model-options-${card.local_id}`;
                 const providerModelHelpText = card.discovering
                   ? t('modelManagementPage.loadingProviderModels')
@@ -827,6 +858,12 @@ const ModelManagementPage: React.FC = () => {
                           <dt className="font-medium text-gray-700">{t('modelManagementPage.currency')}</dt>
                           <dd className="mt-1 text-gray-600">{card.currency || '-'}</dd>
                         </div>
+                        {showsProtocolSelector && (
+                          <div>
+                            <dt className="font-medium text-gray-700">{t('modelManagementPage.protocol')}</dt>
+                            <dd className="mt-1 text-gray-600">{protocolTypeLabel || '-'}</dd>
+                          </div>
+                        )}
                         <div className="sm:col-span-2">
                           <dt className="font-medium text-gray-700">{t('modelManagementPage.baseUrl')}</dt>
                           <dd className="mt-1 break-all text-gray-600">{card.base_url || '-'}</dd>
@@ -896,11 +933,29 @@ const ModelManagementPage: React.FC = () => {
                           getTypeLabel={getProviderTypeLabel}
                           onSelect={(template) => updateCard(card.local_id, {
                             provider_type: template.providerType,
+                            protocol_type: resolveProviderProtocolType(template.providerType, template.protocolType),
                             base_url: template.baseUrl,
                           })}
                         />
                       </div>
                     </div>
+
+                    {showsProtocolSelector && (
+                      <div className="mt-4">
+                        <label className="block text-sm font-medium text-gray-700">{t('modelManagementPage.protocol')}</label>
+                        <select
+                          value={effectiveProtocolType}
+                          onChange={(event) => updateCard(card.local_id, {
+                            protocol_type: resolveProviderProtocolType(card.provider_type, event.target.value),
+                          })}
+                          className="app-input mt-1 block w-full"
+                        >
+                          <option value="openai-compatible">{getProtocolTypeLabel('openai-compatible')}</option>
+                          <option value="anthropic">{getProtocolTypeLabel('anthropic')}</option>
+                        </select>
+                        <p className="mt-2 text-xs text-gray-500">{t('modelManagementPage.localProtocolHelp')}</p>
+                      </div>
+                    )}
 
                     <div className="mt-4">
                       <div className="flex items-center justify-between gap-3">

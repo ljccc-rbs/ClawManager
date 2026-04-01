@@ -100,6 +100,41 @@ func TestBuildProviderRequestPreservesToolConfiguration(t *testing.T) {
 	}
 }
 
+func TestBuildProviderRequestUsesAnthropicProtocolForLocalModel(t *testing.T) {
+	req := ChatCompletionRequest{
+		Model: "gateway-model",
+		Messages: []ChatMessage{
+			{
+				Role:    "user",
+				Content: "hello from local anthropic",
+			},
+		},
+	}
+
+	model := &models.LLMModel{
+		ProviderType:      models.ProviderTypeLocal,
+		ProtocolType:      models.ProtocolTypeAnthropic,
+		ProviderModelName: "claude-local",
+	}
+
+	providerRequestBody, err := buildProviderRequestBody(req, model)
+	if err != nil {
+		t.Fatalf("buildProviderRequestBody returned error: %v", err)
+	}
+
+	var payload anthropicRequestPayload
+	if err := json.Unmarshal(providerRequestBody, &payload); err != nil {
+		t.Fatalf("expected anthropic payload, got decode error: %v", err)
+	}
+
+	if payload.Model != "claude-local" {
+		t.Fatalf("expected provider model name to be replaced, got %q", payload.Model)
+	}
+	if len(payload.Messages) != 1 || payload.Messages[0].Role != "user" {
+		t.Fatalf("expected anthropic user message, got %#v", payload.Messages)
+	}
+}
+
 func TestRewriteStreamLineKeepsToolCalls(t *testing.T) {
 	line := "data: {\"id\":\"chatcmpl-1\",\"model\":\"provider-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Shanghai\\\"}\"}}]},\"finish_reason\":null}]}\n"
 
@@ -262,9 +297,9 @@ func TestResolveTraceIDReusesTraceWhenOpenClawStripsToolCallUnderscore(t *testin
 		invocationService: &stubModelInvocationService{
 			items: []models.ModelInvocation{
 				{
-					TraceID:    "trc_existing",
-					UserID:     intPtr(7),
-					InstanceID: intPtr(19),
+					TraceID:         "trc_existing",
+					UserID:          intPtr(7),
+					InstanceID:      intPtr(19),
 					ResponsePayload: stringPtr("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_d1cad4719db94d1594f93456\",\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"\"}}]}}]}\n\ndata: [DONE]\n"),
 				},
 			},

@@ -21,6 +21,7 @@ type UpsertLLMModelRequest struct {
 	DisplayName       string  `json:"display_name" binding:"required"`
 	Description       *string `json:"description,omitempty"`
 	ProviderType      string  `json:"provider_type" binding:"required"`
+	ProtocolType      string  `json:"protocol_type,omitempty"`
 	BaseURL           string  `json:"base_url" binding:"required"`
 	ProviderModelName string  `json:"provider_model_name" binding:"required"`
 	APIKey            *string `json:"api_key,omitempty"`
@@ -35,6 +36,7 @@ type UpsertLLMModelRequest struct {
 // DiscoverLLMModelsRequest defines fields needed to fetch provider models.
 type DiscoverLLMModelsRequest struct {
 	ProviderType    string  `json:"provider_type" binding:"required"`
+	ProtocolType    string  `json:"protocol_type,omitempty"`
 	BaseURL         string  `json:"base_url" binding:"required"`
 	APIKey          *string `json:"api_key,omitempty"`
 	APIKeySecretRef *string `json:"api_key_secret_ref,omitempty"`
@@ -71,6 +73,7 @@ func (h *LLMModelHandler) UpsertModel(c *gin.Context) {
 		DisplayName:       req.DisplayName,
 		Description:       req.Description,
 		ProviderType:      req.ProviderType,
+		ProtocolType:      req.ProtocolType,
 		BaseURL:           req.BaseURL,
 		ProviderModelName: req.ProviderModelName,
 		APIKey:            req.APIKey,
@@ -99,6 +102,7 @@ func (h *LLMModelHandler) DiscoverModels(c *gin.Context) {
 
 	items, err := h.service.DiscoverProviderModels(services.DiscoverLLMModelsRequest{
 		ProviderType:    req.ProviderType,
+		ProtocolType:    req.ProtocolType,
 		BaseURL:         req.BaseURL,
 		APIKey:          req.APIKey,
 		APIKeySecretRef: req.APIKeySecretRef,

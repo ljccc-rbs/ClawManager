@@ -31,6 +31,7 @@ type SaveLLMModelRequest struct {
 	DisplayName       string
 	Description       *string
 	ProviderType      string
+	ProtocolType      string
 	BaseURL           string
 	ProviderModelName string
 	APIKey            *string
@@ -45,6 +46,7 @@ type SaveLLMModelRequest struct {
 // DiscoverLLMModelsRequest contains fields needed to query a provider for available models.
 type DiscoverLLMModelsRequest struct {
 	ProviderType    string
+	ProtocolType    string
 	BaseURL         string
 	APIKey          *string
 	APIKeySecretRef *string
@@ -100,6 +102,10 @@ func (s *llmModelService) SaveModel(req SaveLLMModelRequest) (*models.LLMModel, 
 	providerType := strings.TrimSpace(strings.ToLower(req.ProviderType))
 	if providerType == "" {
 		return nil, errors.New("provider type is required")
+	}
+	protocolType, err := models.ResolveLLMProtocolType(providerType, req.ProtocolType)
+	if err != nil {
+		return nil, err
 	}
 
 	baseURL := strings.TrimSpace(req.BaseURL)
@@ -173,6 +179,7 @@ func (s *llmModelService) SaveModel(req SaveLLMModelRequest) (*models.LLMModel, 
 		DisplayName:       displayName,
 		Description:       description,
 		ProviderType:      providerType,
+		ProtocolType:      protocolType,
 		BaseURL:           baseURL,
 		ProviderModelName: providerModelName,
 		APIKey:            apiKey,
@@ -215,6 +222,10 @@ func (s *llmModelService) DiscoverProviderModels(req DiscoverLLMModelsRequest) (
 	if providerType == "" {
 		return nil, errors.New("provider type is required")
 	}
+	protocolType, err := models.ResolveLLMProtocolType(providerType, req.ProtocolType)
+	if err != nil {
+		return nil, err
+	}
 
 	baseURL := strings.TrimSpace(req.BaseURL)
 	if baseURL == "" {
@@ -231,14 +242,14 @@ func (s *llmModelService) DiscoverProviderModels(req DiscoverLLMModelsRequest) (
 		apiKey = strings.TrimSpace(*resolvedAPIKey)
 	}
 
-	switch providerType {
-	case "openai", "openai-compatible", "local":
+	switch protocolType {
+	case models.ProtocolTypeOpenAI, models.ProtocolTypeOpenAICompatible:
 		return s.discoverOpenAICompatibleModels(baseURL, apiKey)
-	case "anthropic":
+	case models.ProtocolTypeAnthropic:
 		return s.discoverAnthropicModels(baseURL, apiKey)
-	case "google":
+	case models.ProtocolTypeGoogle:
 		return s.discoverGoogleModels(baseURL, apiKey)
-	case "azure-openai":
+	case models.ProtocolTypeAzureOpenAI:
 		return nil, errors.New("automatic model discovery for azure-openai is not supported yet")
 	default:
 		return nil, errors.New("provider discovery is not supported")

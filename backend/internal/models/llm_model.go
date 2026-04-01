@@ -8,6 +8,7 @@ type LLMModel struct {
 	DisplayName       string    `db:"display_name" json:"display_name"`
 	Description       *string   `db:"description" json:"description,omitempty"`
 	ProviderType      string    `db:"provider_type" json:"provider_type"`
+	ProtocolType      string    `db:"protocol_type" json:"protocol_type,omitempty"`
 	BaseURL           string    `db:"base_url" json:"base_url"`
 	ProviderModelName string    `db:"provider_model_name" json:"provider_model_name"`
 	APIKey            *string   `db:"api_key" json:"api_key,omitempty"`
