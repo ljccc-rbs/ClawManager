@@ -146,9 +146,22 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Insert default admin user (password: admin123)
-INSERT INTO users (username, email, password_hash, role, is_active) VALUES 
-  ('admin', 'admin@clawreef.local', '$2a$10$pbenze514mwv3pvQySQBVOsF5J4DBXL2kVo1hLa8JFhQu5x3AKvBi', 'admin', TRUE);
+INSERT INTO users (username, email, password_hash, role, is_active)
+SELECT 'admin', 'admin@clawreef.local', '$2a$10$pbenze514mwv3pvQySQBVOsF5J4DBXL2kVo1hLa8JFhQu5x3AKvBi', 'admin', TRUE
+FROM DUAL
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM users
+  WHERE username = 'admin' OR email = 'admin@clawreef.local'
+);
 
 -- Insert default quota for admin
 INSERT INTO user_quotas (user_id, max_instances, max_cpu_cores, max_memory_gb, max_storage_gb, max_gpu_count)
-SELECT id, 100, 200, 1000, 5000, 10 FROM users WHERE username = 'admin';
+SELECT users.id, 100, 200, 1000, 5000, 10
+FROM users
+WHERE username = 'admin'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM user_quotas
+    WHERE user_quotas.user_id = users.id
+  );

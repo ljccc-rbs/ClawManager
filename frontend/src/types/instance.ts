@@ -1,3 +1,5 @@
+import type { OpenClawConfigPlan } from './openclawConfig';
+
 export interface Instance {
   id: number;
   user_id: number;
@@ -20,6 +22,7 @@ export interface Instance {
   pod_namespace?: string;
   pod_ip?: string;
   access_url?: string;
+  openclaw_config_snapshot_id?: number;
   created_at: string;
   updated_at: string;
   started_at?: string;
@@ -51,6 +54,7 @@ export interface CreateInstanceRequest {
   image_registry?: string;
   image_tag?: string;
   storage_class?: string;
+  openclaw_config_plan?: OpenClawConfigPlan;
 }
 
 export interface UpdateInstanceRequest {

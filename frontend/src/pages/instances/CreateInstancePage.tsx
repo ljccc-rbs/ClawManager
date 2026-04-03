@@ -1,5 +1,6 @@
 ﻿import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import OpenClawConfigPlanSection, { type OpenClawInjectionMode } from '../../components/OpenClawConfigPlanSection';
 import UserLayout from '../../components/UserLayout';
 import { useAuth } from '../../contexts/AuthContext';
 import { instanceService } from '../../services/instanceService';
@@ -7,6 +8,7 @@ import { userService } from '../../services/userService';
 import { INSTANCE_TYPES, PRESET_CONFIGS } from '../../types/instance';
 import type { CreateInstanceRequest } from '../../types/instance';
 import type { Instance } from '../../types/instance';
+import type { OpenClawConfigCompilePreview } from '../../types/openclawConfig';
 import type { UserQuota } from '../../types/user';
 import { useI18n } from '../../contexts/I18nContext';
 import { systemSettingsService } from '../../services/systemSettingsService';
@@ -24,6 +26,12 @@ const CreateInstancePage: React.FC = () => {
   const [quota, setQuota] = useState<UserQuota | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
   const [openClawImportFile, setOpenClawImportFile] = useState<File | null>(null);
+  const [openClawInjectionMode, setOpenClawInjectionMode] = useState<OpenClawInjectionMode>('none');
+  const [openClawBundleId, setOpenClawBundleId] = useState<number | undefined>(undefined);
+  const [openClawResourceIds, setOpenClawResourceIds] = useState<number[]>([]);
+  const [openClawPreview, setOpenClawPreview] = useState<OpenClawConfigCompilePreview | null>(null);
+  const [openClawPreviewLoading, setOpenClawPreviewLoading] = useState(false);
+  const [openClawPreviewError, setOpenClawPreviewError] = useState<string | null>(null);
   const openClawImportInputRef = useRef<HTMLInputElement | null>(null);
 
   const [formData, setFormData] = useState<CreateInstanceRequest>({
@@ -112,6 +120,11 @@ const CreateInstancePage: React.FC = () => {
     if (instanceType) {
       if (typeId !== 'openclaw') {
         setOpenClawImportFile(null);
+        setOpenClawInjectionMode('none');
+        setOpenClawBundleId(undefined);
+        setOpenClawResourceIds([]);
+        setOpenClawPreview(null);
+        setOpenClawPreviewError(null);
       }
       setFormData({
         ...formData,
@@ -145,9 +158,18 @@ const CreateInstancePage: React.FC = () => {
     try {
       setLoading(true);
       setError(null);
-      const createdInstance = await instanceService.createInstance(formData);
+      const createPayload: CreateInstanceRequest = {
+        ...formData,
+        openclaw_config_plan: formData.type === 'openclaw' && openClawInjectionMode === 'bundle' && openClawBundleId
+          ? { mode: 'bundle', bundle_id: openClawBundleId }
+          : formData.type === 'openclaw' && openClawInjectionMode === 'manual' && openClawResourceIds.length > 0
+            ? { mode: 'manual', resource_ids: openClawResourceIds }
+            : undefined,
+      };
 
-      if (formData.type === 'openclaw' && openClawImportFile) {
+      const createdInstance = await instanceService.createInstance(createPayload);
+
+      if (formData.type === 'openclaw' && openClawInjectionMode === 'archive' && openClawImportFile) {
         await waitForInstanceRunning(createdInstance.id);
         await instanceService.importOpenClawWorkspace(createdInstance.id, openClawImportFile);
       }
@@ -246,7 +268,18 @@ const CreateInstancePage: React.FC = () => {
 
   const exceededQuotaItems = quotaChecks.filter((item) => item.exceeded);
   const quotaExceeded = exceededQuotaItems.length > 0;
-  const createDisabled = loading || !submitArmed || quotaLoading || !quota || quotaExceeded;
+  const openClawPlanInvalid = formData.type === 'openclaw' && (
+    (openClawInjectionMode === 'bundle' && (!openClawBundleId || !!openClawPreviewError || openClawPreviewLoading)) ||
+    (openClawInjectionMode === 'manual' && (openClawResourceIds.length === 0 || !!openClawPreviewError || openClawPreviewLoading)) ||
+    (openClawInjectionMode === 'archive' && !openClawImportFile)
+  );
+  const createDisabled = loading || !submitArmed || quotaLoading || !quota || quotaExceeded || openClawPlanInvalid;
+
+  const handleOpenClawPreviewChange = React.useCallback((preview: OpenClawConfigCompilePreview | null, state: { loading: boolean; error: string | null }) => {
+    setOpenClawPreview(preview);
+    setOpenClawPreviewLoading(state.loading);
+    setOpenClawPreviewError(state.error);
+  }, []);
 
   const renderTypeIcon = (typeId: string) => {
     if (typeId === 'openclaw') {
@@ -525,56 +558,143 @@ const CreateInstancePage: React.FC = () => {
               </div>
 
               {formData.type === 'openclaw' && (
-                <div className="app-panel p-6">
-                  <div className="flex items-start justify-between gap-4">
-                    <div>
-                      <h2 className="text-lg font-medium text-gray-900">{t('instances.openClawImportTitle')}</h2>
-                      <p className="mt-1 text-sm text-gray-500">
-                        {t('instances.openClawImportDesc')}
-                      </p>
-                    </div>
-                    <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-medium text-indigo-600">
-                      {t('instances.optional')}
-                    </span>
-                  </div>
-
-                  <input
-                    ref={openClawImportInputRef}
-                    type="file"
-                    accept=".tar.gz,.tgz,application/gzip,application/x-gzip,application/octet-stream"
-                    className="hidden"
-                    onChange={(e) => setOpenClawImportFile(e.target.files?.[0] || null)}
+                <div className="space-y-6">
+                  <OpenClawConfigPlanSection
+                    mode={openClawInjectionMode}
+                    bundleId={openClawBundleId}
+                    resourceIds={openClawResourceIds}
+                    onModeChange={(nextMode) => {
+                      setOpenClawInjectionMode(nextMode);
+                      setOpenClawPreview(null);
+                      setOpenClawPreviewError(null);
+                      if (nextMode !== 'bundle') {
+                        setOpenClawBundleId(undefined);
+                      }
+                      if (nextMode !== 'manual') {
+                        setOpenClawResourceIds([]);
+                      }
+                      if (nextMode !== 'archive') {
+                        setOpenClawImportFile(null);
+                        if (openClawImportInputRef.current) {
+                          openClawImportInputRef.current.value = '';
+                        }
+                      }
+                    }}
+                    onSelectionChange={({ bundleId, resourceIds }) => {
+                      setOpenClawBundleId(bundleId);
+                      setOpenClawResourceIds(resourceIds);
+                    }}
+                    onPreviewChange={handleOpenClawPreviewChange}
                   />
 
-                  <div className="mt-5 flex flex-wrap items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => openClawImportInputRef.current?.click()}
-                      className="app-button-secondary"
-                    >
-                      {openClawImportFile ? t('instances.changeOpenClawArchive') : t('instances.chooseOpenClawArchive')}
-                    </button>
-                    {openClawImportFile && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setOpenClawImportFile(null);
-                          if (openClawImportInputRef.current) {
-                            openClawImportInputRef.current.value = '';
-                          }
-                        }}
-                        className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700 hover:bg-red-100"
-                      >
-                        {t('instances.remove')}
-                      </button>
-                    )}
-                  </div>
+                  {openClawInjectionMode === 'archive' && (
+                    <div className="app-panel p-6">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <h2 className="text-lg font-medium text-gray-900">{t('instances.openClawImportTitle')}</h2>
+                          <p className="mt-1 text-sm text-gray-500">
+                            {t('instances.openClawImportDesc')}
+                          </p>
+                        </div>
+                        <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-medium text-indigo-600">
+                          Required for archive mode
+                        </span>
+                      </div>
 
-                  <div className="mt-4 rounded-lg border border-dashed border-gray-300 bg-gray-50 px-4 py-3 text-sm text-gray-600">
-                    {openClawImportFile
-                      ? t('instances.selectedArchive', { name: openClawImportFile.name })
-                      : t('instances.noArchiveSelected')}
-                  </div>
+                      <input
+                        ref={openClawImportInputRef}
+                        type="file"
+                        accept=".tar.gz,.tgz,application/gzip,application/x-gzip,application/octet-stream"
+                        className="hidden"
+                        onChange={(e) => setOpenClawImportFile(e.target.files?.[0] || null)}
+                      />
+
+                      <div className="mt-5 flex flex-wrap items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => openClawImportInputRef.current?.click()}
+                          className="app-button-secondary"
+                        >
+                          {openClawImportFile ? t('instances.changeOpenClawArchive') : t('instances.chooseOpenClawArchive')}
+                        </button>
+                        {openClawImportFile && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenClawImportFile(null);
+                              if (openClawImportInputRef.current) {
+                                openClawImportInputRef.current.value = '';
+                              }
+                            }}
+                            className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700 hover:bg-red-100"
+                          >
+                            {t('instances.remove')}
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="mt-4 rounded-lg border border-dashed border-gray-300 bg-gray-50 px-4 py-3 text-sm text-gray-600">
+                        {openClawImportFile
+                          ? t('instances.selectedArchive', { name: openClawImportFile.name })
+                          : t('instances.noArchiveSelected')}
+                      </div>
+                    </div>
+                  )}
+
+                  {(openClawInjectionMode === 'bundle' || openClawInjectionMode === 'manual') && (
+                    <div className="app-panel p-6">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <h2 className="text-lg font-medium text-gray-900">Config Preview</h2>
+                          <p className="mt-1 text-sm text-gray-500">
+                            We compile your selected config assets before instance creation so dependency and payload issues show up early.
+                          </p>
+                        </div>
+                        {openClawPreviewLoading && (
+                          <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
+                            Compiling...
+                          </span>
+                        )}
+                      </div>
+
+                      {openClawPreviewError && (
+                        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                          {openClawPreviewError}
+                        </div>
+                      )}
+
+                      {openClawPreview && (
+                        <div className="mt-4 space-y-4">
+                          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                            <div className="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3">
+                              <div className="text-xs uppercase tracking-[0.18em] text-gray-500">Resolved Resources</div>
+                              <div className="mt-2 text-2xl font-semibold text-gray-900">{openClawPreview.resolved_resources.length}</div>
+                            </div>
+                            <div className="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3">
+                              <div className="text-xs uppercase tracking-[0.18em] text-gray-500">Env Variables</div>
+                              <div className="mt-2 text-2xl font-semibold text-gray-900">{openClawPreview.env_names.length}</div>
+                            </div>
+                            <div className="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3">
+                              <div className="text-xs uppercase tracking-[0.18em] text-gray-500">Payload Size</div>
+                              <div className="mt-2 text-2xl font-semibold text-gray-900">{openClawPreview.total_payload_bytes} B</div>
+                            </div>
+                          </div>
+
+                          {openClawPreview.auto_included.length > 0 && (
+                            <div className="rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-700">
+                              Auto included dependencies: {openClawPreview.auto_included.map((item) => item.name).join(', ')}
+                            </div>
+                          )}
+
+                          {openClawPreview.warnings.length > 0 && (
+                            <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+                              {openClawPreview.warnings.join(' ')}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -642,9 +762,15 @@ const CreateInstancePage: React.FC = () => {
                   </div>
                   {formData.type === 'openclaw' && (
                     <div className="sm:col-span-2">
-                      <dt className="text-sm font-medium text-gray-500">{t('instances.openClawImportTitle')}</dt>
-                      <dd className="mt-1 text-sm text-gray-900">
-                        {openClawImportFile ? openClawImportFile.name : t('instances.noOpenClawArchiveSelected')}
+                      <dt className="text-sm font-medium text-gray-500">OpenClaw Bootstrap</dt>
+                      <dd className="mt-1 space-y-1 text-sm text-gray-900">
+                        <div>Mode: {openClawInjectionMode}</div>
+                        {openClawInjectionMode === 'archive' && (
+                          <div>{openClawImportFile ? openClawImportFile.name : t('instances.noOpenClawArchiveSelected')}</div>
+                        )}
+                        {(openClawInjectionMode === 'bundle' || openClawInjectionMode === 'manual') && openClawPreview && (
+                          <div>{openClawPreview.resolved_resources.length} resource(s), {openClawPreview.env_names.length} env payload(s)</div>
+                        )}
                       </dd>
                     </div>
                   )}
@@ -678,7 +804,7 @@ const CreateInstancePage: React.FC = () => {
                 disabled={createDisabled}
                 className="app-button-primary disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {quotaLoading ? t('instances.checkingQuota') : loading ? (formData.type === 'openclaw' && openClawImportFile ? t('instances.creatingAndImporting') : t('instances.creatingNow')) : t('instances.createNow')}
+                {quotaLoading ? t('instances.checkingQuota') : loading ? (formData.type === 'openclaw' && openClawInjectionMode === 'archive' && openClawImportFile ? t('instances.creatingAndImporting') : t('instances.creatingNow')) : t('instances.createNow')}
               </button>
             )}
           </div>

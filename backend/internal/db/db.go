@@ -35,6 +35,10 @@ func Initialize(cfg config.DatabaseConfig) (db.Session, error) {
 		_ = session.Close()
 		return nil, fmt.Errorf("failed to configure database connection charset: %w", err)
 	}
+	if err := applyEmbeddedMigrations(session); err != nil {
+		_ = session.Close()
+		return nil, fmt.Errorf("failed to apply database migrations: %w", err)
+	}
 
 	Session = session
 	log.Println("Database connected successfully")

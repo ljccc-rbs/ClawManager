@@ -21,6 +21,7 @@ import RiskRulesPage from '../pages/admin/RiskRulesPage';
 import ModelManagementPage from '../pages/admin/ModelManagementPage';
 import SystemSettingsPage from '../pages/admin/SystemSettingsPage';
 import UserSettingsPage from '../pages/settings/UserSettingsPage';
+import OpenClawConfigCenterPage from '../pages/openclaw/OpenClawConfigCenterPage';
 
 // Instance Pages
 import InstanceListPage from '../pages/instances/InstanceListPage';
@@ -176,6 +177,14 @@ function AppRoutes() {
         element={
           <ProtectedRoute>
             <InstancePortalPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/openclaw-configs"
+        element={
+          <ProtectedRoute>
+            <OpenClawConfigCenterPage />
           </ProtectedRoute>
         }
       />

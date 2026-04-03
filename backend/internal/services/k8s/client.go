@@ -243,6 +243,11 @@ func (c *Client) GetServiceName(instanceID int, instanceName string) string {
 	return sanitizeK8sName(fmt.Sprintf("clawreef-%d-%s-svc", instanceID, instanceName))
 }
 
+// GetOpenClawBootstrapSecretName returns the secret name used to store rendered OpenClaw bootstrap payloads.
+func (c *Client) GetOpenClawBootstrapSecretName(instanceID int, instanceName string) string {
+	return sanitizeK8sName(fmt.Sprintf("clawreef-%d-%s-openclaw-bootstrap", instanceID, instanceName))
+}
+
 // GetNetworkPolicyName returns the default network policy name for an instance.
 func (c *Client) GetNetworkPolicyName(instanceID int, instanceName string) string {
 	return sanitizeK8sName(fmt.Sprintf("clawreef-%d-%s-netpol", instanceID, instanceName))

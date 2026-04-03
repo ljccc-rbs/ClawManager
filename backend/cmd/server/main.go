@@ -53,6 +53,7 @@ func main() {
 	chatMessageRepo := repository.NewChatMessageRepository(database)
 	riskRuleRepo := repository.NewRiskRuleRepository(database)
 	riskHitRepo := repository.NewRiskHitRepository(database)
+	openClawConfigRepo := repository.NewOpenClawConfigRepository(database)
 
 	if repaired, repairErr := services.RepairSeededAdminPassword(userRepo); repairErr != nil {
 		log.Printf("Warning: failed to repair seeded admin password: %v", repairErr)
@@ -74,10 +75,11 @@ func main() {
 	riskDetectionService := services.NewRiskDetectionService(riskRuleRepo)
 	riskHitService := services.NewRiskHitService(riskHitRepo)
 	riskRuleService := services.NewRiskRuleService(riskRuleRepo)
+	openClawConfigService := services.NewOpenClawConfigService(openClawConfigRepo)
 	aiObservabilityService := services.NewAIObservabilityService(modelInvocationRepo, auditEventRepo, costRecordRepo, riskHitRepo, chatMessageRepo, llmModelRepo, instanceRepo, userRepo)
 	clusterResourceService := services.NewClusterResourceService(instanceRepo)
 	services.SetRuntimeImageSettingsProvider(systemImageSettingService)
-	instanceService := services.NewInstanceService(instanceRepo, quotaRepo, llmModelRepo)
+	instanceService := services.NewInstanceService(instanceRepo, quotaRepo, llmModelRepo, openClawConfigService)
 	aiGatewayService := aigateway.NewService(llmModelRepo, modelInvocationService, auditEventService, costRecordService, riskDetectionService, riskHitService, chatSessionService, chatMessageService)
 
 	// Initialize handlers
@@ -91,6 +93,7 @@ func main() {
 	riskRuleHandler := handlers.NewRiskRuleHandler(riskRuleService)
 	clusterResourceHandler := handlers.NewClusterResourceHandler(clusterResourceService)
 	egressProxyHandler := handlers.NewEgressProxyHandler()
+	openClawConfigHandler := handlers.NewOpenClawConfigHandler(openClawConfigService)
 
 	// Initialize WebSocket hub and handler
 	wsHub := services.GetHub()
@@ -166,6 +169,30 @@ func main() {
 			instances.POST("/:id/sync", instanceHandler.ForceSync)
 			instances.GET("/:id/openclaw/export", instanceHandler.ExportOpenClaw)
 			instances.POST("/:id/openclaw/import", instanceHandler.ImportOpenClaw)
+		}
+
+		openClawConfigs := api.Group("/openclaw-configs")
+		openClawConfigs.Use(middleware.Auth())
+		openClawConfigs.Use(middleware.SetUserInfo(userRepo))
+		{
+			openClawConfigs.GET("/resources", openClawConfigHandler.ListResources)
+			openClawConfigs.POST("/resources", openClawConfigHandler.CreateResource)
+			openClawConfigs.POST("/resources/validate", openClawConfigHandler.ValidateResource)
+			openClawConfigs.GET("/resources/:id", openClawConfigHandler.GetResource)
+			openClawConfigs.PUT("/resources/:id", openClawConfigHandler.UpdateResource)
+			openClawConfigs.DELETE("/resources/:id", openClawConfigHandler.DeleteResource)
+			openClawConfigs.POST("/resources/:id/clone", openClawConfigHandler.CloneResource)
+
+			openClawConfigs.GET("/bundles", openClawConfigHandler.ListBundles)
+			openClawConfigs.POST("/bundles", openClawConfigHandler.CreateBundle)
+			openClawConfigs.GET("/bundles/:id", openClawConfigHandler.GetBundle)
+			openClawConfigs.PUT("/bundles/:id", openClawConfigHandler.UpdateBundle)
+			openClawConfigs.DELETE("/bundles/:id", openClawConfigHandler.DeleteBundle)
+			openClawConfigs.POST("/bundles/:id/clone", openClawConfigHandler.CloneBundle)
+
+			openClawConfigs.POST("/compile-preview", openClawConfigHandler.CompilePreview)
+			openClawConfigs.GET("/injections", openClawConfigHandler.ListSnapshots)
+			openClawConfigs.GET("/injections/:id", openClawConfigHandler.GetSnapshot)
 		}
 
 		systemSettings := api.Group("/system-settings")

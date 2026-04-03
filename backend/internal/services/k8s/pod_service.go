@@ -31,18 +31,19 @@ func (s *PodService) GetClient() *Client {
 
 // PodConfig holds configuration for creating a pod
 type PodConfig struct {
-	InstanceID    int
-	InstanceName  string
-	UserID        int
-	Type          string
-	CPUCores      int
-	MemoryGB      int
-	GPUEnabled    bool
-	GPUCount      int
-	Image         string
-	MountPath     string
-	ContainerPort int32
-	ExtraEnv      map[string]string
+	InstanceID         int
+	InstanceName       string
+	UserID             int
+	Type               string
+	CPUCores           int
+	MemoryGB           int
+	GPUEnabled         bool
+	GPUCount           int
+	Image              string
+	MountPath          string
+	ContainerPort      int32
+	ExtraEnv           map[string]string
+	EnvFromSecretNames []string
 }
 
 // CreatePod creates a new pod for an instance
@@ -171,6 +172,17 @@ func (s *PodService) CreatePod(ctx context.Context, config PodConfig) (*corev1.P
 		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
 			Name:  key,
 			Value: value,
+		})
+	}
+
+	for _, secretName := range config.EnvFromSecretNames {
+		if secretName == "" {
+			continue
+		}
+		pod.Spec.Containers[0].EnvFrom = append(pod.Spec.Containers[0].EnvFrom, corev1.EnvFromSource{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+			},
 		})
 	}
 

@@ -147,7 +147,7 @@ jobs:
           )
 
           text = re.sub(
-              r"\n\s+nodePort:\s+39443",
+              r"\n\s+nodePort:\s+\d+",
               "",
               text,
               count=1,

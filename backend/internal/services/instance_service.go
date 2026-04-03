@@ -31,19 +31,20 @@ type InstanceService interface {
 
 // CreateInstanceRequest holds data for creating an instance
 type CreateInstanceRequest struct {
-	Name          string  `json:"name" validate:"required,min=3,max=50"`
-	Description   *string `json:"description,omitempty"`
-	Type          string  `json:"type" validate:"required,oneof=openclaw ubuntu debian centos custom webtop"`
-	CPUCores      int     `json:"cpu_cores" validate:"required,min=1,max=32"`
-	MemoryGB      int     `json:"memory_gb" validate:"required,min=1,max=128"`
-	DiskGB        int     `json:"disk_gb" validate:"required,min=10,max=1000"`
-	GPUEnabled    bool    `json:"gpu_enabled"`
-	GPUCount      int     `json:"gpu_count" validate:"min=0,max=4"`
-	OSType        string  `json:"os_type" validate:"required"`
-	OSVersion     string  `json:"os_version" validate:"required"`
-	ImageRegistry *string `json:"image_registry,omitempty"`
-	ImageTag      *string `json:"image_tag,omitempty"`
-	StorageClass  string  `json:"storage_class"`
+	Name               string              `json:"name" validate:"required,min=3,max=50"`
+	Description        *string             `json:"description,omitempty"`
+	Type               string              `json:"type" validate:"required,oneof=openclaw ubuntu debian centos custom webtop"`
+	CPUCores           int                 `json:"cpu_cores" validate:"required,min=1,max=32"`
+	MemoryGB           int                 `json:"memory_gb" validate:"required,min=1,max=128"`
+	DiskGB             int                 `json:"disk_gb" validate:"required,min=10,max=1000"`
+	GPUEnabled         bool                `json:"gpu_enabled"`
+	GPUCount           int                 `json:"gpu_count" validate:"min=0,max=4"`
+	OSType             string              `json:"os_type" validate:"required"`
+	OSVersion          string              `json:"os_version" validate:"required"`
+	ImageRegistry      *string             `json:"image_registry,omitempty"`
+	ImageTag           *string             `json:"image_tag,omitempty"`
+	StorageClass       string              `json:"storage_class"`
+	OpenClawConfigPlan *OpenClawConfigPlan `json:"openclaw_config_plan,omitempty"`
 }
 
 // UpdateInstanceRequest holds data for updating an instance
@@ -66,25 +67,27 @@ type InstanceStatus struct {
 
 // instanceService implements InstanceService
 type instanceService struct {
-	instanceRepo         repository.InstanceRepository
-	quotaRepo            repository.QuotaRepository
-	llmModelRepo         repository.LLMModelRepository
-	podService           *k8s.PodService
-	pvcService           *k8s.PVCService
-	serviceService       *k8s.ServiceService
-	networkPolicyService *k8s.NetworkPolicyService
+	instanceRepo          repository.InstanceRepository
+	quotaRepo             repository.QuotaRepository
+	llmModelRepo          repository.LLMModelRepository
+	openClawConfigService OpenClawConfigService
+	podService            *k8s.PodService
+	pvcService            *k8s.PVCService
+	serviceService        *k8s.ServiceService
+	networkPolicyService  *k8s.NetworkPolicyService
 }
 
 // NewInstanceService creates a new instance service
-func NewInstanceService(instanceRepo repository.InstanceRepository, quotaRepo repository.QuotaRepository, llmModelRepo repository.LLMModelRepository) InstanceService {
+func NewInstanceService(instanceRepo repository.InstanceRepository, quotaRepo repository.QuotaRepository, llmModelRepo repository.LLMModelRepository, openClawConfigService OpenClawConfigService) InstanceService {
 	return &instanceService{
-		instanceRepo:         instanceRepo,
-		quotaRepo:            quotaRepo,
-		llmModelRepo:         llmModelRepo,
-		podService:           k8s.NewPodService(),
-		pvcService:           k8s.NewPVCService(),
-		serviceService:       k8s.NewServiceService(),
-		networkPolicyService: k8s.NewNetworkPolicyService(),
+		instanceRepo:          instanceRepo,
+		quotaRepo:             quotaRepo,
+		llmModelRepo:          llmModelRepo,
+		openClawConfigService: openClawConfigService,
+		podService:            k8s.NewPodService(),
+		pvcService:            k8s.NewPVCService(),
+		serviceService:        k8s.NewServiceService(),
+		networkPolicyService:  k8s.NewNetworkPolicyService(),
 	}
 }
 
@@ -214,6 +217,31 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 		return nil, fmt.Errorf("failed to build instance gateway config: %w", err)
 	}
 
+	var bootstrapSnapshot *models.OpenClawInjectionSnapshot
+	var bootstrapSecretName string
+	if strings.EqualFold(instance.Type, "openclaw") && s.openClawConfigService != nil && req.OpenClawConfigPlan != nil && hasOpenClawConfigSelections(*req.OpenClawConfigPlan) {
+		bootstrapSnapshot, err = s.openClawConfigService.CreateSnapshotForInstance(userID, instance, req.OpenClawConfigPlan)
+		if err != nil {
+			s.instanceRepo.Delete(instance.ID)
+			return nil, fmt.Errorf("failed to compile openclaw bootstrap config: %w", err)
+		}
+		if bootstrapSnapshot != nil {
+			instance.OpenClawConfigSnapshotID = &bootstrapSnapshot.ID
+			instance.UpdatedAt = time.Now()
+			if err := s.instanceRepo.Update(instance); err != nil {
+				s.instanceRepo.Delete(instance.ID)
+				return nil, fmt.Errorf("failed to persist openclaw snapshot reference: %w", err)
+			}
+
+			bootstrapSecretName, err = s.openClawConfigService.EnsureSnapshotSecret(ctx, userID, instance, bootstrapSnapshot.ID)
+			if err != nil {
+				_ = s.openClawConfigService.MarkSnapshotFailed(bootstrapSnapshot, err)
+				s.instanceRepo.Delete(instance.ID)
+				return nil, fmt.Errorf("failed to provision openclaw bootstrap secret: %w", err)
+			}
+		}
+	}
+
 	// Create PVC
 	// If storage class is not specified in request, use empty string
 	// PVCService will use the default from K8s client config
@@ -222,6 +250,9 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 	_, err = s.pvcService.CreatePVC(ctx, userID, instance.ID, req.DiskGB, storageClass)
 	if err != nil {
 		// Rollback: delete instance record
+		if bootstrapSnapshot != nil {
+			_ = s.openClawConfigService.MarkSnapshotFailed(bootstrapSnapshot, err)
+		}
 		s.instanceRepo.Delete(instance.ID)
 		return nil, fmt.Errorf("failed to create PVC: %w", err)
 	}
@@ -229,6 +260,9 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 	if requiresRestrictedNetwork(instance.Type) {
 		if err := s.networkPolicyService.EnsureDefaultPolicy(ctx, userID, instance.ID, instance.Name); err != nil {
 			s.pvcService.DeletePVC(ctx, userID, instance.ID)
+			if bootstrapSnapshot != nil {
+				_ = s.openClawConfigService.MarkSnapshotFailed(bootstrapSnapshot, err)
+			}
 			s.instanceRepo.Delete(instance.ID)
 			return nil, fmt.Errorf("failed to create network policy: %w", err)
 		}
@@ -236,18 +270,19 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 
 	// Create Pod
 	podConfig := k8s.PodConfig{
-		InstanceID:    instance.ID,
-		InstanceName:  instance.Name,
-		UserID:        userID,
-		Type:          instance.Type,
-		CPUCores:      instance.CPUCores,
-		MemoryGB:      instance.MemoryGB,
-		GPUEnabled:    instance.GPUEnabled,
-		GPUCount:      instance.GPUCount,
-		Image:         runtimeConfig.Image,
-		MountPath:     runtimeConfig.MountPath,
-		ContainerPort: runtimeConfig.Port,
-		ExtraEnv:      withInstanceProxyEnv(instance.Type, instance.ID, mergeEnvMaps(runtimeConfig.Env, gatewayEnv)),
+		InstanceID:         instance.ID,
+		InstanceName:       instance.Name,
+		UserID:             userID,
+		Type:               instance.Type,
+		CPUCores:           instance.CPUCores,
+		MemoryGB:           instance.MemoryGB,
+		GPUEnabled:         instance.GPUEnabled,
+		GPUCount:           instance.GPUCount,
+		Image:              runtimeConfig.Image,
+		MountPath:          runtimeConfig.MountPath,
+		ContainerPort:      runtimeConfig.Port,
+		ExtraEnv:           withInstanceProxyEnv(instance.Type, instance.ID, mergeEnvMaps(runtimeConfig.Env, gatewayEnv)),
+		EnvFromSecretNames: []string{bootstrapSecretName},
 	}
 
 	pod, err := s.podService.CreatePod(ctx, podConfig)
@@ -257,6 +292,9 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 			s.networkPolicyService.DeletePolicy(ctx, userID, instance.ID, instance.Name)
 		}
 		s.pvcService.DeletePVC(ctx, userID, instance.ID)
+		if bootstrapSnapshot != nil {
+			_ = s.openClawConfigService.MarkSnapshotFailed(bootstrapSnapshot, err)
+		}
 		s.instanceRepo.Delete(instance.ID)
 		return nil, fmt.Errorf("failed to create pod: %w", err)
 	}
@@ -278,6 +316,9 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 			s.networkPolicyService.DeletePolicy(ctx, userID, instance.ID, instance.Name)
 		}
 		s.pvcService.DeletePVC(ctx, userID, instance.ID)
+		if bootstrapSnapshot != nil {
+			_ = s.openClawConfigService.MarkSnapshotFailed(bootstrapSnapshot, err)
+		}
 		s.instanceRepo.Delete(instance.ID)
 		return nil, fmt.Errorf("failed to create service: %w", err)
 	}
@@ -295,9 +336,18 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 
 	fmt.Printf("Instance %d created successfully, updating database with status 'creating'\n", instance.ID)
 	if err := s.instanceRepo.Update(instance); err != nil {
+		if bootstrapSnapshot != nil {
+			_ = s.openClawConfigService.MarkSnapshotFailed(bootstrapSnapshot, err)
+		}
 		return nil, fmt.Errorf("failed to update instance with pod info: %w", err)
 	}
 	fmt.Printf("Instance %d database updated, broadcasting status via WebSocket\n", instance.ID)
+
+	if bootstrapSnapshot != nil {
+		if err := s.openClawConfigService.MarkSnapshotActive(bootstrapSnapshot); err != nil {
+			return nil, fmt.Errorf("failed to activate openclaw bootstrap snapshot: %w", err)
+		}
+	}
 
 	// Broadcast initial creating status via WebSocket. Sync service will mark it
 	// running only after the pod becomes Ready.
@@ -353,6 +403,14 @@ func (s *instanceService) Start(instanceID int) error {
 		return fmt.Errorf("failed to build instance gateway config: %w", err)
 	}
 
+	bootstrapSecretName := ""
+	if strings.EqualFold(instance.Type, "openclaw") && s.openClawConfigService != nil && instance.OpenClawConfigSnapshotID != nil && *instance.OpenClawConfigSnapshotID > 0 {
+		bootstrapSecretName, err = s.openClawConfigService.EnsureSnapshotSecret(ctx, instance.UserID, instance, *instance.OpenClawConfigSnapshotID)
+		if err != nil {
+			return fmt.Errorf("failed to restore openclaw bootstrap secret: %w", err)
+		}
+	}
+
 	// Create new pod
 	runtimeConfig := buildRuntimeConfig(instance.Type, instance.OSType, instance.OSVersion, instance.ImageRegistry, instance.ImageTag)
 	if requiresRestrictedNetwork(instance.Type) {
@@ -362,18 +420,19 @@ func (s *instanceService) Start(instanceID int) error {
 	}
 
 	podConfig := k8s.PodConfig{
-		InstanceID:    instance.ID,
-		InstanceName:  instance.Name,
-		UserID:        instance.UserID,
-		Type:          instance.Type,
-		CPUCores:      instance.CPUCores,
-		MemoryGB:      instance.MemoryGB,
-		GPUEnabled:    instance.GPUEnabled,
-		GPUCount:      instance.GPUCount,
-		Image:         runtimeConfig.Image,
-		MountPath:     instance.MountPath,
-		ContainerPort: runtimeConfig.Port,
-		ExtraEnv:      withInstanceProxyEnv(instance.Type, instance.ID, mergeEnvMaps(runtimeConfig.Env, gatewayEnv)),
+		InstanceID:         instance.ID,
+		InstanceName:       instance.Name,
+		UserID:             instance.UserID,
+		Type:               instance.Type,
+		CPUCores:           instance.CPUCores,
+		MemoryGB:           instance.MemoryGB,
+		GPUEnabled:         instance.GPUEnabled,
+		GPUCount:           instance.GPUCount,
+		Image:              runtimeConfig.Image,
+		MountPath:          instance.MountPath,
+		ContainerPort:      runtimeConfig.Port,
+		ExtraEnv:           withInstanceProxyEnv(instance.Type, instance.ID, mergeEnvMaps(runtimeConfig.Env, gatewayEnv)),
+		EnvFromSecretNames: []string{bootstrapSecretName},
 	}
 
 	pod, err := s.podService.CreatePod(ctx, podConfig)
