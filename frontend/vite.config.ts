@@ -8,8 +8,12 @@ export default defineConfig({
     port: 9002,
     host: true,
     proxy: {
+      '/api/agent-security': {
+        target: 'http://localhost:9003',
+        changeOrigin: true,
+      },
       '/api': {
-        target: 'http://127.0.0.1:9001',
+        target: 'http://192.168.17.134:9001',
         changeOrigin: true,
         ws: true,
       },

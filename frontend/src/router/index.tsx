@@ -21,7 +21,10 @@ import RiskRulesPage from '../pages/admin/RiskRulesPage';
 import ModelManagementPage from '../pages/admin/ModelManagementPage';
 import SystemSettingsPage from '../pages/admin/SystemSettingsPage';
 import UserSettingsPage from '../pages/settings/UserSettingsPage';
-import OpenClawConfigCenterPage from '../pages/openclaw/OpenClawConfigCenterPage';
+
+//xzadd
+import AgentSecurityPage from '../pages/admin/AgentSecurityPage';
+
 
 // Instance Pages
 import InstanceListPage from '../pages/instances/InstanceListPage';
@@ -181,14 +184,6 @@ function AppRoutes() {
         }
       />
       <Route
-        path="/openclaw-configs"
-        element={
-          <ProtectedRoute>
-            <OpenClawConfigCenterPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
         path="/settings"
         element={
           <ProtectedRoute>
@@ -230,6 +225,16 @@ function AppRoutes() {
           </AdminRoute>
         }
       />
+      
+      <Route
+  	path="/admin/agent-security"
+  	element={
+    	<AdminRoute>
+      		<AgentSecurityPage />
+   	</AdminRoute>
+  	}
+       />
+
       <Route
         path="/admin/ai-audit"
         element={

@@ -906,6 +906,7 @@ export const translations: Record<Locale, TranslationTree> = {
       instances: '实例',
       aiGateway: 'AI 网关',
       aiAudit: 'AI 审计',
+      agentSecurity:'养虾安全',
       costs: '成本',
       riskRules: '风控规则',
       models: '模型',

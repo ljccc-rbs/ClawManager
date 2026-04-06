@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"from main import app; print\\('Import OK'\\)\")",
+      "Read(//c/test/**)",
+      "Bash(python -c \"from main import read_ransom_logs; logs = read_ransom_logs\\(\\); print\\(f'{len\\(logs\\)} logs parsed'\\); print\\(json.dumps\\(logs[0], ensure_ascii=False\\)\\)\")",
+      "Bash(python -c \"import json; from main import read_ransom_logs; logs = read_ransom_logs\\(\\); print\\(f'{len\\(logs\\)} logs'\\); print\\(json.dumps\\(logs[0], ensure_ascii=False\\)\\)\")"
+    ]
+  }
+}
