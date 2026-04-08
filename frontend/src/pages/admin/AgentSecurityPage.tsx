@@ -19,6 +19,8 @@ type SecurityStatus = 'healthy' | 'warning' | 'disabled';
 interface SecurityModuleMeta {
   key: SecurityModuleKey;
   title: string;
+  shortTitle: string;  // 用于最新安全告警等简洁展示
+  typeId: string;  // 数据库中存储的类型编号
   description: string;
   policyOptions: string[];
 }
@@ -26,31 +28,39 @@ interface SecurityModuleMeta {
 const MODULE_META: SecurityModuleMeta[] = [
   {
     key: 'skillAcquisition',
-    title: '虾苗获取安全',
+    title: '虾苗选购（Skills安全）',
+    shortTitle: '虾苗选购',
+    typeId: '1',
     description:
-      '在安装 Skill 时检测恶意代码与高风险行为，及时阻止危险 Skill 进入虾的运行环境。',
+      '在安装 Skill 时实时扫描检测病毒与恶意代码，确保引入的虾苗健康无害。',
     policyOptions: ['KSecure扫描引擎'],
   },
   {
-    key: 'runtimeProtection',
-    title: '养虾过程安全',
+    key: 'environment',
+    title: '虾池安全（环境安全）',
+    shortTitle: '虾池安全',
+    typeId: '2',
     description:
-      '在虾使用上传资料、知识库内容或外部引用语料时，识别被投毒内容并及时阻断。',
-    policyOptions: ['企业级安全扫描', '开源安全扫描'],
+      '防御勒索病毒、入侵攻击与异常风险，保护虾的运行环境不被破坏。',
+    policyOptions: ['勒索病毒防护', '入侵检测', '风险发现', '文件/进程保护'],
+  },
+  {
+    key: 'runtimeProtection',
+    title: '日常投喂（恶意行为检测）',
+    shortTitle: '日常投喂',
+    typeId: '3',
+    description:
+      '在虾的日常使用过程中，实时检测恶意命令与异常行为，防止投毒和非法操作。',
+    policyOptions: ['恶意命令检测', '异常行为监控'],
   },
   {
     key: 'compliance',
-    title: '安全合规',
+    title: '成虾收获（隐私保护）',
+    shortTitle: '成虾收获',
+    typeId: '4',
     description:
-      '通过敏感信息防护、数据隐私保护与响应规则，保障虾的输入输出符合企业合规要求。',
-    policyOptions: ['敏感信息防护策略', '数据隐私保护策略', '输出响应规则'],
-  },
-  {
-    key: 'environment',
-    title: '环境安全',
-    description:
-      '在主机遭遇勒索病毒或异常环境攻击时，保护虾的技能、记忆、材料与输出结果不被破坏。',
-    policyOptions: ['勒索病毒防护', '入侵检测', '风险发现', '文件/进程保护'],
+      '在虾的输出结果中检测敏感信息，防止隐私数据泄露，保障合规交付。',
+    policyOptions: ['敏感信息检测', '隐私数据脱敏', '输出合规审查'],
   },
 ];
 
@@ -89,13 +99,15 @@ const AgentSecurityPage: React.FC = () => {
 
   useEffect(() => {
     loadData();
+    const timer = setInterval(() => { fetchLogs().then(setLogs).catch(() => {}); }, 60_000);
+    return () => clearInterval(timer);
   }, [loadData]);
 
   const modules: ModuleDisplay[] = useMemo(() => {
     return MODULE_META.map((meta) => {
       const state = moduleStates[meta.key];
       const enabled = state?.enabled ?? true;
-      const moduleLogs = logs.filter((l) => l.type === meta.title);
+      const moduleLogs = logs.filter((l) => l.type === meta.typeId);
       const hasHighRisk = moduleLogs.some((l) => l.level === '高危');
 
       let status: SecurityStatus = 'healthy';
@@ -164,6 +176,8 @@ const AgentSecurityPage: React.FC = () => {
     return { enabledCount, totalCount: modules.length, totalPolicies, todayAlerts, highRiskAlerts };
   }, [modules]);
 
+  const typeIdToShortTitle = Object.fromEntries(MODULE_META.map((m) => [m.typeId, m.shortTitle]));
+
   const mergedLogs = useMemo(() => {
     return logs.slice(0, 8);
   }, [logs]);
@@ -215,8 +229,8 @@ const AgentSecurityPage: React.FC = () => {
                 养虾安全控制台
               </h2>
               <p className="mt-3 text-sm leading-7 text-[#6e6763] md:text-[15px]">
-                覆盖虾苗获取、养虾过程、安全合规、环境安全四类防护能力，支持开关控制、策略选择与最新告警查看，
-                帮助你从安装、使用、输出到运行环境，完整保护虾的安全。
+                覆盖虾苗选购、虾池安全、日常投喂、成虾收获四类防护能力，支持开关控制、策略选择与最新告警查看，
+                帮助你从 Skill 获取、环境防护、运行监控到隐私保护，完整守护虾的安全。
               </p>
             </div>
 
@@ -327,9 +341,6 @@ const AgentSecurityPage: React.FC = () => {
                       <div className="text-sm font-semibold text-[#171212]">最新告警日志</div>
                       <div className="mt-1 text-xs text-[#8a817b]">及时查看该模块最近的安全事件与处理结果</div>
                     </div>
-                    <button type="button" className="text-sm font-medium text-[#dc5a37] transition hover:text-[#b64223]">
-                      查看全部
-                    </button>
                   </div>
                   <div className="space-y-3">
                     {module.logs.length === 0 && (
@@ -375,20 +386,14 @@ const AgentSecurityPage: React.FC = () => {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className={`h-2.5 w-2.5 rounded-full ${getRiskDotClass(log.level)}`} />
                     <span className={`text-xs font-semibold ${getRiskTextClass(log.level)}`}>{log.level}</span>
-                    <span className="rounded-full bg-[#f7efe9] px-2.5 py-1 text-xs font-medium text-[#8b5f4d]">{log.type}</span>
+                    <span className="rounded-full bg-[#f7efe9] px-2.5 py-1 text-xs font-medium text-[#8b5f4d]">{typeIdToShortTitle[log.type] ?? log.type}</span>
                     <span className="text-sm font-semibold text-[#171212]">{log.title}</span>
                   </div>
                   <p className="mt-2 text-sm leading-6 text-[#6e6763]">{log.description}</p>
                 </div>
-                <div className="flex shrink-0 items-center gap-4">
-                  <div className="text-right">
-                    <div className="text-xs font-medium text-[#8a817b]">{log.time}</div>
-                    <div className="mt-1 text-sm font-semibold text-[#171212]">{log.result}</div>
-                  </div>
-                  <button type="button"
-                    className="inline-flex items-center rounded-2xl border border-[#e7dcd5] bg-white px-4 py-2 text-sm font-medium text-[#5f5753] transition hover:border-[#ef6b4a] hover:text-[#171212]">
-                    查看详情
-                  </button>
+                <div className="shrink-0 text-right">
+                  <div className="text-xs font-medium text-[#8a817b]">{log.time}</div>
+                  <div className="mt-1 text-sm font-semibold text-[#171212]">{log.result}</div>
                 </div>
               </div>
             ))}

@@ -9,7 +9,12 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-DB_PATH = Path(__file__).parent / "secclaw.db"
+
+# DB文件路径：Linux 生产环境 vs Windows 测试环境
+if platform.system() == "Windows":
+    DB_PATH = Path(__file__).parent / "secclaw.db"
+else:
+    DB_PATH = Path("/opt/KSec/policy/secclaw.db")
 
 # 环境安全日志文件路径：Linux 生产环境 vs Windows 测试环境
 if platform.system() == "Windows":
@@ -66,12 +71,12 @@ def init_db():
             modules = [
                 ("skillAcquisition", 1, "KSecure扫描引擎",
                  json.dumps(["KSecure扫描引擎"])),
-                ("runtimeProtection", 1, "企业级安全扫描",
-                 json.dumps(["企业级安全扫描", "开源安全扫描"])),
-                ("compliance", 1, "敏感信息防护 + 数据隐私保护",
-                 json.dumps(["敏感信息防护策略", "数据隐私保护策略", "输出响应规则"])),
                 ("environment", 1, "勒索病毒防护 + 入侵检测 + 风险发现 + 文件/进程保护",
                  json.dumps(["勒索病毒防护", "入侵检测", "风险发现", "文件/进程保护"])),
+                ("runtimeProtection", 1, "恶意命令检测 + 异常行为监控",
+                 json.dumps(["恶意命令检测", "异常行为监控"])),
+                ("compliance", 1, "敏感信息检测 + 隐私数据脱敏 + 输出合规审查",
+                 json.dumps(["敏感信息检测", "隐私数据脱敏", "输出合规审查"])),
             ]
             conn.executemany(
                 "INSERT INTO security_modules (key, enabled, policy_label, selected_policies) VALUES (?, ?, ?, ?)",
@@ -82,17 +87,17 @@ def init_db():
         count = conn.execute("SELECT COUNT(*) FROM sys_log").fetchone()[0]
         if count == 0:
             logs = [
-                ("虾苗获取安全", "高危", "检测到可疑远程执行逻辑",
+                ("1", "高危", "检测到可疑远程执行逻辑",
                  "新安装 Skill 中发现高风险执行路径，系统已阻止安装。", "2026-04-06 14:58:00", "已拦截"),
-                ("虾苗获取安全", "信息", "依赖包安全检查通过",
+                ("1", "信息", "依赖包安全检查通过",
                  "安装包依赖已完成扫描，未发现明显风险。", "2026-04-06 14:42:00", "已放行"),
-                ("养虾过程安全", "高危", "检测到投毒语料",
-                 "上传资料命中高风险投毒特征，系统已阻止导入知识库。", "2026-04-06 14:51:00", "已拦截"),
-                ("养虾过程安全", "信息", "上传内容通过安全检查",
-                 "最新一批训练材料已完成扫描，未发现明显风险。", "2026-04-06 14:29:00", "已放行"),
-                ("安全合规", "高危", "输出命中身份证号",
+                ("3", "高危", "检测到恶意命令",
+                 "运行过程中捕获可疑指令，系统已阻止执行。", "2026-04-06 14:51:00", "已拦截"),
+                ("3", "信息", "行为监控正常",
+                 "当前会话未检测到异常行为，运行状态良好。", "2026-04-06 14:29:00", "已放行"),
+                ("4", "高危", "输出命中身份证号",
                  "生成内容包含身份证号，已按规则执行脱敏处理。", "2026-04-06 14:55:00", "已拦截"),
-                ("安全合规", "信息", "合规检查通过",
+                ("4", "信息", "隐私检查通过",
                  "本次输出内容未命中任何敏感规则，正常放行。", "2026-04-06 14:34:00", "已放行"),
             ]
             conn.executemany(
@@ -186,7 +191,7 @@ def read_ransom_logs() -> list[dict]:
             continue
         results.append({
             "id": idx,
-            "type": "环境安全",
+            "type": "2",
             "level": "高危",
             "title": f"勒索行为已阻断（{entry.get('action', '')}）",
             "description": f"检测到可疑加密行为，用户 {entry.get('user', '?')}，已自动终止相关进程。",
@@ -204,7 +209,7 @@ def read_ransom_logs() -> list[dict]:
 @app.get("/api/agent-security/logs")
 def list_logs(type: str | None = Query(default=None)):
     # 环境安全日志来自文件
-    if type == "环境安全":
+    if type == "2":
         return read_ransom_logs()
 
     # 其他模块从数据库读取
@@ -227,7 +232,7 @@ def list_logs(type: str | None = Query(default=None)):
             "result": r["result"],
         }
         for r in rows
-        if r["type"] != "环境安全"  # 全量查询时排除数据库中的环境安全 seed 数据
+        if r["type"] != "2"  # 全量查询时排除数据库中的环境安全 seed 数据
     ]
 
     # 全量查询时合并文件日志

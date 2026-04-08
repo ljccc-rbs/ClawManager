@@ -13,7 +13,7 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/api': {
-        target: 'http://192.168.17.134:9001',
+        target: 'http://1localhost:9001',
         changeOrigin: true,
         ws: true,
       },
